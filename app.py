@@ -1,14 +1,44 @@
 import streamlit as st
 import pandas as pd
 import re
+import os
+import json
 import smtplib
 import ssl
 from email.mime.text import MIMEText
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import plotly.graph_objects as go
 import plotly.express as px
 import yfinance as yf
 from streamlit_autorefresh import st_autorefresh
+
+# Indian Standard Time (UTC+5:30) -- used for all "last refreshed" / alert timestamps
+IST = timezone(timedelta(hours=5, minutes=30))
+
+def now_ist():
+    return datetime.now(IST)
+
+# Where manual ticker overrides are stored permanently (survives app restarts)
+OVERRIDES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ticker_overrides.json")
+
+def load_overrides():
+    """Load saved manual ticker overrides from disk. Returns {} if file doesn't exist yet."""
+    try:
+        if os.path.exists(OVERRIDES_FILE):
+            with open(OVERRIDES_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def save_overrides(overrides: dict):
+    """Persist manual ticker overrides to disk so they survive app restarts/redeploys."""
+    try:
+        with open(OVERRIDES_FILE, "w", encoding="utf-8") as f:
+            json.dump(overrides, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
 
 # 1. PAGE CONFIG + PREMIUM DARK THEME
 st.set_page_config(page_title="AlphaPortfolio Terminal Pro+", layout="wide", initial_sidebar_state="expanded")
@@ -286,7 +316,7 @@ def check_and_send_52week_alerts(df_with_ranges, sender_email, app_password, rec
             body = (f"{name} ({ticker}) has touched its 52-week HIGH.\n\n"
                     f"Current Price: {live:.2f}\n"
                     f"52-Week High: {high_52w:.2f}\n\n"
-                    f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                    f"Time (IST): {now_ist().strftime('%Y-%m-%d %H:%M:%S')}")
             ok, msg = send_email_alert(sender_email, app_password, recipient_email, subject, body)
             if ok:
                 already_alerted_set.add(alert_key_high)
@@ -298,7 +328,7 @@ def check_and_send_52week_alerts(df_with_ranges, sender_email, app_password, rec
             body = (f"{name} ({ticker}) has touched its 52-week LOW.\n\n"
                     f"Current Price: {live:.2f}\n"
                     f"52-Week Low: {low_52w:.2f}\n\n"
-                    f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                    f"Time (IST): {now_ist().strftime('%Y-%m-%d %H:%M:%S')}")
             ok, msg = send_email_alert(sender_email, app_password, recipient_email, subject, body)
             if ok:
                 already_alerted_set.add(alert_key_low)
@@ -312,7 +342,7 @@ def check_and_send_52week_alerts(df_with_ranges, sender_email, app_password, rec
 if "alerted_keys" not in st.session_state:
     st.session_state.alerted_keys = set()
 if "manual_ticker_overrides" not in st.session_state:
-    st.session_state.manual_ticker_overrides = {}
+    st.session_state.manual_ticker_overrides = load_overrides()  # load any previously saved overrides from disk
 
 # ==================== SIDEBAR (TERMINAL CONTROLS) ====================
 with st.sidebar:
@@ -354,25 +384,20 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("### 🛠️ Manual Ticker Overrides")
-    st.caption("If a company couldn't be auto-resolved, type its exact Yahoo ticker here (e.g. TATAMOTORS.NS) and it will be used instead of auto-search.")
-    manual_override_text = st.text_area(
-        "One per line: CompanyNameAsInFile = TICKER",
-        value="\n".join(f"{k} = {v}" for k, v in st.session_state.manual_ticker_overrides.items()),
-        placeholder="Tata Motors = TATAMOTORS.NS\nABC Ltd = ABCLTD.BO",
-        height=100
-    )
-    if st.button("💾 Save Manual Tickers", use_container_width=True):
-        overrides = {}
-        for line in manual_override_text.splitlines():
-            if "=" in line:
-                k, v = line.split("=", 1)
-                k, v = k.strip(), v.strip()
-                if k and v:
-                    overrides[k] = v
-        st.session_state.manual_ticker_overrides = overrides
-        st.cache_data.clear()
-        st.success(f"Saved {len(overrides)} manual ticker override(s). Data will refresh now.")
-        st.rerun()
+    st.caption("Companies that couldn't be auto-found will show an input box right next to their name on the main dashboard (below the warning). Fill those in — they get saved here automatically.")
+    if st.session_state.manual_ticker_overrides:
+        st.caption(f"✅ {len(st.session_state.manual_ticker_overrides)} manual ticker(s) currently saved.")
+        with st.expander("View / Clear saved overrides"):
+            for k, v in list(st.session_state.manual_ticker_overrides.items()):
+                ov_col1, ov_col2 = st.columns([3, 1])
+                ov_col1.write(f"**{k}** → `{v}`")
+                if ov_col2.button("❌", key=f"del_ov_{k}"):
+                    st.session_state.manual_ticker_overrides.pop(k, None)
+                    save_overrides(st.session_state.manual_ticker_overrides)
+                    st.cache_data.clear()
+                    st.rerun()
+    else:
+        st.caption("No manual overrides saved yet.")
 
 # ==================== FILE UPLOAD INTERFACE ====================
 st.markdown("<h2 style='text-align: left; color: #ffffff;'>📊 Portfolio Intelligence Terminal v4.0</h2>", unsafe_allow_html=True)
@@ -499,11 +524,36 @@ elif not df.empty:
 
     if unresolved_entries:
         st.markdown(
-            '<div class="risk-warning">⚠️ <b>No Yahoo ticker could be found for the following entries, so their live price will show as ₹0:</b><br>'
-            + ", ".join(unresolved_entries)
-            + '<br><small>Fix: open the sidebar → "Manual Ticker Overrides" and enter the exact Yahoo ticker for these entries (e.g. <code>Tata Motors = TATAMOTORS.NS</code>), then click Save.</small></div>',
+            f'<div class="risk-warning">⚠️ <b>No Yahoo ticker could be found for {len(unresolved_entries)} compan(ies) below, so their live price shows as ₹0.</b><br>'
+            'Type the exact Yahoo ticker next to each company (e.g. <code>TATAMOTORS.NS</code> for Tata Motors, <code>RELIANCE.NS</code> for Reliance) and click Save below. '
+            'These will be remembered for next time too.</div>',
             unsafe_allow_html=True
         )
+        with st.expander(f"✏️ Fix {len(unresolved_entries)} unresolved compan(ies) now", expanded=True):
+            with st.form(key="fix_unresolved_form"):
+                fix_inputs = {}
+                for entry in unresolved_entries:
+                    fcol1, fcol2 = st.columns([3, 2])
+                    fcol1.write(entry)
+                    fix_inputs[entry] = fcol2.text_input(
+                        "Yahoo ticker", key=f"fix_{entry}", placeholder="e.g. TATAMOTORS.NS",
+                        label_visibility="collapsed"
+                    )
+                submitted = st.form_submit_button("💾 Save All Tickers Entered Above", use_container_width=True)
+                if submitted:
+                    newly_saved = 0
+                    for entry, ticker_val in fix_inputs.items():
+                        ticker_val = ticker_val.strip()
+                        if ticker_val:
+                            st.session_state.manual_ticker_overrides[entry] = ticker_val.upper()
+                            newly_saved += 1
+                    if newly_saved > 0:
+                        save_overrides(st.session_state.manual_ticker_overrides)
+                        st.cache_data.clear()
+                        st.success(f"✅ Saved {newly_saved} ticker(s). Refreshing data now...")
+                        st.rerun()
+                    else:
+                        st.warning("No tickers were entered. Type at least one ticker before saving.")
 
     # Market stress test calculations
     df['Simulated_Live'] = df['live_price'] * (1 + (market_shock / 100))
@@ -564,7 +614,7 @@ elif not df.empty:
 
     # ==================== MENU 1: OVERVIEW ====================
     if "Overview" in menu or "🖥️" in menu:
-        st.caption(f"🔄 Live data auto-refreshes every 60 seconds. Last refreshed: {datetime.now().strftime('%H:%M:%S')}")
+        st.caption(f"🔄 Live data auto-refreshes every 60 seconds. Last refreshed: {now_ist().strftime('%H:%M:%S')} IST")
 
         if market_shock != 0:
             st.info(f"⚠️ **Simulation Mode Active:** A {market_shock}% market change is being simulated.")
