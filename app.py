@@ -338,11 +338,221 @@ def check_and_send_52week_alerts(df_with_ranges, sender_email, app_password, rec
     return sent_any, messages
 
 
+# ===================================================================
+# 💼 TRANSACTION LEDGER ENGINE (Buy/Sell tracking, FIFO realized P&L, XIRR)
+# ===================================================================
+TRANSACTIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "transactions.csv")
+TX_COLUMNS = ["date", "share_name", "ticker", "txn_type", "quantity", "price"]
+
+HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "portfolio_history.csv")
+HISTORY_COLUMNS = ["date", "total_invested", "total_current", "total_pnl"]
+
+
+def load_transactions() -> pd.DataFrame:
+    """Load the saved buy/sell transaction ledger from disk. Returns an empty frame if none yet."""
+    try:
+        if os.path.exists(TRANSACTIONS_FILE):
+            df_tx = pd.read_csv(TRANSACTIONS_FILE)
+            df_tx['date'] = pd.to_datetime(df_tx['date'], errors='coerce')
+            return df_tx
+    except Exception:
+        pass
+    return pd.DataFrame(columns=TX_COLUMNS)
+
+
+def save_transactions(df_tx: pd.DataFrame):
+    """Persist the transaction ledger to disk so it survives app restarts."""
+    try:
+        out = df_tx.copy()
+        out['date'] = pd.to_datetime(out['date']).dt.strftime('%Y-%m-%d')
+        out.to_csv(TRANSACTIONS_FILE, index=False)
+        return True
+    except Exception:
+        return False
+
+
+def append_transactions(new_rows: pd.DataFrame):
+    """Append new transaction rows to the existing ledger and persist."""
+    existing = load_transactions()
+    combined = pd.concat([existing, new_rows], ignore_index=True)
+    save_transactions(combined)
+    return combined
+
+
+def compute_fifo_realized_pnl(df_tx: pd.DataFrame):
+    """For each share_name, matches SELL transactions against earlier BUY lots using FIFO
+    (First-In-First-Out -- the standard, tax-compliant method in India).
+
+    Returns:
+        realized_df: one row per SELL transaction with realized P&L, holding period, STCG/LTCG tag
+        open_lots_df: remaining unsold BUY lots per share_name (used to cross-check open quantity)
+    """
+    if df_tx.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    realized_rows = []
+    open_lots_rows = []
+
+    for share_name, group in df_tx.sort_values('date').groupby('share_name'):
+        # FIFO queue of open buy lots: each lot = [date, qty_remaining, price]
+        buy_queue = []
+        for _, row in group.iterrows():
+            qty = float(row['quantity'])
+            price = float(row['price'])
+            date = row['date']
+            ticker = row.get('ticker', '')
+
+            if str(row['txn_type']).upper() == 'BUY':
+                buy_queue.append({"date": date, "qty": qty, "price": price})
+            elif str(row['txn_type']).upper() == 'SELL':
+                qty_to_sell = qty
+                while qty_to_sell > 1e-9 and buy_queue:
+                    lot = buy_queue[0]
+                    matched_qty = min(lot['qty'], qty_to_sell)
+
+                    holding_days = (date - lot['date']).days if pd.notna(date) and pd.notna(lot['date']) else 0
+                    term = "LTCG (>1yr)" if holding_days > 365 else "STCG (<1yr)"
+
+                    realized_pnl = (price - lot['price']) * matched_qty
+                    realized_rows.append({
+                        "share_name": share_name,
+                        "ticker": ticker,
+                        "sell_date": date,
+                        "buy_date": lot['date'],
+                        "quantity": matched_qty,
+                        "buy_price": lot['price'],
+                        "sell_price": price,
+                        "realized_pnl": realized_pnl,
+                        "holding_days": holding_days,
+                        "tax_term": term
+                    })
+
+                    lot['qty'] -= matched_qty
+                    qty_to_sell -= matched_qty
+                    if lot['qty'] <= 1e-9:
+                        buy_queue.pop(0)
+
+        # Whatever is left in buy_queue is still held (open position)
+        for lot in buy_queue:
+            if lot['qty'] > 1e-9:
+                open_lots_rows.append({
+                    "share_name": share_name,
+                    "buy_date": lot['date'],
+                    "quantity": lot['qty'],
+                    "buy_price": lot['price']
+                })
+
+    realized_df = pd.DataFrame(realized_rows)
+    open_lots_df = pd.DataFrame(open_lots_rows)
+    return realized_df, open_lots_df
+
+
+def calculate_xirr(cashflows):
+    """Calculates XIRR (annualized real rate of return) given a list of (date, amount) tuples.
+    Negative amounts = money going out (buys), positive = money coming in (sells / current value).
+    Uses Newton's method with a bisection fallback for robustness -- no external dependency needed."""
+    if len(cashflows) < 2:
+        return None
+
+    dates = [c[0] for c in cashflows]
+    amounts = [c[1] for c in cashflows]
+    t0 = min(dates)
+
+    def xnpv(rate):
+        return sum(amt / ((1 + rate) ** ((d - t0).days / 365.0)) for d, amt in zip(dates, amounts))
+
+    def xnpv_derivative(rate):
+        return sum(-((d - t0).days / 365.0) * amt / ((1 + rate) ** (((d - t0).days / 365.0) + 1))
+                   for d, amt in zip(dates, amounts))
+
+    rate = 0.1
+    for _ in range(100):
+        try:
+            f = xnpv(rate)
+            f_prime = xnpv_derivative(rate)
+            if abs(f_prime) < 1e-10:
+                break
+            new_rate = rate - f / f_prime
+            if abs(new_rate - rate) < 1e-7:
+                rate = new_rate
+                break
+            rate = new_rate
+        except (OverflowError, ZeroDivisionError):
+            break
+
+    if rate <= -1 or rate > 100 or pd.isna(rate):
+        # Fallback: bisection search between -99% and +1000% return
+        lo, hi = -0.99, 10.0
+        for _ in range(200):
+            mid = (lo + hi) / 2
+            try:
+                val = xnpv(mid)
+            except OverflowError:
+                val = float('inf')
+            if abs(val) < 1e-3:
+                return mid * 100
+            if val > 0:
+                lo = mid
+            else:
+                hi = mid
+        return None
+
+    return rate * 100
+
+
+def append_history_snapshot(total_invested, total_current, total_pnl):
+    """Saves today's portfolio totals as a snapshot row (one row per day) for the trend chart."""
+    try:
+        today_str = now_ist().strftime('%Y-%m-%d')
+        if os.path.exists(HISTORY_FILE):
+            hist = pd.read_csv(HISTORY_FILE)
+        else:
+            hist = pd.DataFrame(columns=HISTORY_COLUMNS)
+
+        hist = hist[hist['date'] != today_str]  # replace today's snapshot if it already exists
+        new_row = pd.DataFrame([{
+            "date": today_str, "total_invested": total_invested,
+            "total_current": total_current, "total_pnl": total_pnl
+        }])
+        hist = pd.concat([hist, new_row], ignore_index=True)
+        hist.to_csv(HISTORY_FILE, index=False)
+    except Exception:
+        pass
+
+
+def load_history():
+    try:
+        if os.path.exists(HISTORY_FILE):
+            hist = pd.read_csv(HISTORY_FILE)
+            hist['date'] = pd.to_datetime(hist['date'])
+            return hist.sort_values('date')
+    except Exception:
+        pass
+    return pd.DataFrame(columns=HISTORY_COLUMNS)
+
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def fetch_sector_info(tickers_list):
+    """Fetches sector/industry classification for each ticker from Yahoo Finance."""
+    sector_map = {}
+    for ticker in tickers_list:
+        if not ticker:
+            continue
+        try:
+            info = yf.Ticker(ticker).info
+            sector_map[ticker] = info.get('sector') or 'Unknown'
+        except Exception:
+            sector_map[ticker] = 'Unknown'
+    return sector_map
+
+
 # Session state init
 if "alerted_keys" not in st.session_state:
     st.session_state.alerted_keys = set()
 if "manual_ticker_overrides" not in st.session_state:
     st.session_state.manual_ticker_overrides = load_overrides()  # load any previously saved overrides from disk
+if "transactions_df" not in st.session_state:
+    st.session_state.transactions_df = load_transactions()
 
 # ==================== SIDEBAR (TERMINAL CONTROLS) ====================
 with st.sidebar:
@@ -352,7 +562,8 @@ with st.sidebar:
         "🖥️ Overview Dashboard",
         "📈 Advanced Analysis",
         "🔍 Single Stock Matrix",
-        "🔎 Search Any Stock"
+        "🔎 Search Any Stock",
+        "💼 Transaction Ledger (Buy/Sell)"
     ])
     st.markdown("---")
 
@@ -454,6 +665,151 @@ if "Search Any Stock" in menu or "🔎" in menu:
                 st.plotly_chart(fig_search, use_container_width=True)
     else:
         st.info("💡 Enter a company name or ticker above to see its live price and 52-week range.")
+
+# ==================== TRANSACTION LEDGER TAB (Buy/Sell tracking, FIFO P&L, XIRR) ====================
+elif "Transaction Ledger" in menu or "💼" in menu:
+    st.markdown("<h3>💼 Transaction Ledger — Buy/Sell Tracking</h3>", unsafe_allow_html=True)
+    st.caption("Record every buy and sell here. Realized profit/loss on sold shares is calculated using FIFO (First-In-First-Out) — the same method used for Indian capital gains tax.")
+
+    tx_tab1, tx_tab2, tx_tab3 = st.tabs(["➕ Add Transaction", "📤 Bulk Upload (CSV/Excel)", "📜 Full Ledger"])
+
+    # ---------- TAB: Manual single entry ----------
+    with tx_tab1:
+        with st.form("add_transaction_form", clear_on_submit=True):
+            tcol1, tcol2 = st.columns(2)
+            with tcol1:
+                tx_share_name = st.text_input("Company Name", placeholder="e.g. Reliance Industries")
+                tx_ticker = st.text_input("Yahoo Ticker (optional, helps auto-fetch sector/price)", placeholder="e.g. RELIANCE.NS")
+                tx_type = st.radio("Transaction Type", ["BUY", "SELL"], horizontal=True)
+            with tcol2:
+                tx_date = st.date_input("Transaction Date", value=now_ist().date())
+                tx_qty = st.number_input("Quantity", min_value=0.0, step=1.0, format="%.2f")
+                tx_price = st.number_input("Price per share (₹)", min_value=0.0, step=0.01, format="%.2f")
+
+            tx_submitted = st.form_submit_button("💾 Add Transaction", use_container_width=True)
+            if tx_submitted:
+                if not tx_share_name or tx_qty <= 0 or tx_price <= 0:
+                    st.error("⚠️ Please fill in Company Name, Quantity, and Price (both must be greater than 0).")
+                else:
+                    new_row = pd.DataFrame([{
+                        "date": pd.to_datetime(tx_date), "share_name": tx_share_name.strip(),
+                        "ticker": tx_ticker.strip().upper(), "txn_type": tx_type,
+                        "quantity": tx_qty, "price": tx_price
+                    }])
+                    st.session_state.transactions_df = append_transactions(new_row)
+                    st.success(f"✅ Added: {tx_type} {tx_qty} shares of {tx_share_name} @ ₹{tx_price}")
+                    st.rerun()
+
+    # ---------- TAB: Bulk CSV/Excel upload ----------
+    with tx_tab2:
+        st.caption("Upload a CSV/Excel with columns: **date, share_name, ticker, txn_type, quantity, price** (txn_type should be BUY or SELL). Column names are matched automatically, case-insensitive.")
+        tx_file = st.file_uploader("Upload transactions file", type=['csv', 'xlsx'], key="tx_bulk_upload")
+        if tx_file is not None:
+            try:
+                if tx_file.name.endswith('.csv'):
+                    bulk_df = pd.read_csv(tx_file)
+                else:
+                    bulk_df = pd.read_excel(tx_file)
+                bulk_df.columns = [c.strip().lower() for c in bulk_df.columns]
+
+                col_map = {}
+                for needed in ['date', 'share_name', 'ticker', 'txn_type', 'quantity', 'price']:
+                    matches = [c for c in bulk_df.columns if needed.replace('_', '') in c.replace('_', '').replace(' ', '')]
+                    if matches:
+                        col_map[needed] = matches[0]
+
+                missing = [c for c in ['date', 'share_name', 'txn_type', 'quantity', 'price'] if c not in col_map]
+                if missing:
+                    st.error(f"⚠️ Could not find required column(s): {', '.join(missing)}. Please rename your file's columns and re-upload.")
+                else:
+                    preview_df = pd.DataFrame({
+                        "date": pd.to_datetime(bulk_df[col_map['date']], errors='coerce'),
+                        "share_name": bulk_df[col_map['share_name']].astype(str).str.strip(),
+                        "ticker": bulk_df[col_map.get('ticker', col_map['share_name'])].astype(str).str.strip().str.upper() if 'ticker' in col_map else "",
+                        "txn_type": bulk_df[col_map['txn_type']].astype(str).str.strip().str.upper(),
+                        "quantity": pd.to_numeric(bulk_df[col_map['quantity']], errors='coerce'),
+                        "price": pd.to_numeric(bulk_df[col_map['price']], errors='coerce'),
+                    })
+                    preview_df = preview_df.dropna(subset=['date', 'share_name', 'quantity', 'price'])
+                    preview_df = preview_df[preview_df['txn_type'].isin(['BUY', 'SELL'])]
+
+                    st.write(f"📋 Preview — {len(preview_df)} valid transaction(s) found:")
+                    st.dataframe(preview_df, use_container_width=True, height=200)
+
+                    if st.button("✅ Confirm & Add All These Transactions", use_container_width=True):
+                        st.session_state.transactions_df = append_transactions(preview_df)
+                        st.success(f"✅ Added {len(preview_df)} transactions to your ledger.")
+                        st.rerun()
+            except Exception as e:
+                st.error(f"⚠️ Could not read file: {e}")
+
+    # ---------- TAB: Full ledger view + FIFO realized P&L ----------
+    with tx_tab3:
+        tx_df = st.session_state.transactions_df
+
+        if tx_df.empty:
+            st.info("💡 No transactions recorded yet. Add your first one in the '➕ Add Transaction' tab.")
+        else:
+            st.markdown("#### 📜 All Recorded Transactions")
+            display_tx = tx_df.copy().sort_values('date', ascending=False)
+            display_tx['date'] = display_tx['date'].dt.strftime('%Y-%m-%d')
+            st.dataframe(display_tx, use_container_width=True, height=250)
+
+            tx_dl_col, tx_clear_col = st.columns([3, 1])
+            with tx_dl_col:
+                st.download_button("📥 Download Full Ledger (CSV)", data=tx_df.to_csv(index=False).encode('utf-8'),
+                                    file_name="transaction_ledger.csv", mime="text/csv", use_container_width=True)
+            with tx_clear_col:
+                if st.button("🗑️ Clear All", use_container_width=True):
+                    st.session_state.transactions_df = pd.DataFrame(columns=TX_COLUMNS)
+                    save_transactions(st.session_state.transactions_df)
+                    st.rerun()
+
+            st.markdown("---")
+            st.markdown("#### 💰 Realized Profit/Loss (FIFO method)")
+
+            realized_df, open_lots_df = compute_fifo_realized_pnl(tx_df)
+
+            if realized_df.empty:
+                st.info("No SELL transactions recorded yet, so there's no realized P&L to show. (Holdings you haven't sold show as Unrealized P&L on the main Overview tab instead.)")
+            else:
+                total_realized = realized_df['realized_pnl'].sum()
+                stcg_pnl = realized_df[realized_df['tax_term'].str.contains('STCG')]['realized_pnl'].sum()
+                ltcg_pnl = realized_df[realized_df['tax_term'].str.contains('LTCG')]['realized_pnl'].sum()
+
+                rc1, rc2, rc3 = st.columns(3)
+                with rc1:
+                    r_color = "#00ff66" if total_realized >= 0 else "#ff3333"
+                    st.markdown(f'<div class="terminal-card"><div class="metric-title">TOTAL REALIZED P&L</div><div class="metric-value" style="color:{r_color};">₹ {total_realized:,.2f}</div></div>', unsafe_allow_html=True)
+                with rc2:
+                    st.markdown(f'<div class="terminal-card"><div class="metric-title">SHORT-TERM (STCG) P&L</div><div class="metric-value" style="color:#00bfff;">₹ {stcg_pnl:,.2f}</div></div>', unsafe_allow_html=True)
+                with rc3:
+                    st.markdown(f'<div class="terminal-card"><div class="metric-title">LONG-TERM (LTCG) P&L</div><div class="metric-value" style="color:#00bfff;">₹ {ltcg_pnl:,.2f}</div></div>', unsafe_allow_html=True)
+
+                st.markdown("##### Sell-by-sell breakdown (FIFO matched against earlier buy lots)")
+                realized_show = realized_df.copy()
+                realized_show['sell_date'] = pd.to_datetime(realized_show['sell_date']).dt.strftime('%Y-%m-%d')
+                realized_show['buy_date'] = pd.to_datetime(realized_show['buy_date']).dt.strftime('%Y-%m-%d')
+                realized_show.columns = ['Stock', 'Ticker', 'Sell Date', 'Buy Date (FIFO)', 'Qty', 'Buy Price', 'Sell Price', 'Realized P&L (₹)', 'Holding Days', 'Tax Term']
+                st.dataframe(
+                    realized_show.style.format({'Buy Price': '₹{:,.2f}', 'Sell Price': '₹{:,.2f}', 'Realized P&L (₹)': '₹{:,.2f}'})
+                    .map(color_pnl, subset=['Realized P&L (₹)']),
+                    use_container_width=True, height=250
+                )
+
+                st.caption("💡 Estimated tax (not financial/tax advice): STCG taxed @20%, LTCG taxed @12.5% above ₹1 lakh exemption per year, per current Indian tax rules.")
+                est_stcg_tax = max(0, stcg_pnl) * 0.20
+                est_ltcg_tax = max(0, ltcg_pnl - 100000) * 0.125 if ltcg_pnl > 100000 else 0
+                st.write(f"Estimated tax on realized gains this ledger: **₹{est_stcg_tax + est_ltcg_tax:,.2f}** (STCG: ₹{est_stcg_tax:,.2f} + LTCG: ₹{est_ltcg_tax:,.2f})")
+
+            if not open_lots_df.empty:
+                st.markdown("---")
+                st.markdown("#### 📦 Remaining Open Lots (still held, FIFO basis)")
+                st.caption("This shows what's technically still unsold according to your transaction history. Cross-check this against your uploaded portfolio file on the Overview tab.")
+                open_show = open_lots_df.copy()
+                open_show['buy_date'] = pd.to_datetime(open_show['buy_date']).dt.strftime('%Y-%m-%d')
+                open_show.columns = ['Stock', 'Buy Date', 'Qty Remaining', 'Buy Price']
+                st.dataframe(open_show.style.format({'Buy Price': '₹{:,.2f}'}), use_container_width=True, height=200)
 
 elif not df.empty:
     # Strip whitespace from column names
@@ -589,6 +945,9 @@ elif not df.empty:
     win_rate = (profit_stocks / total_stocks) * 100 if total_stocks > 0 else 0
     high_risk_stocks = df[df['Weight'] > 25]
 
+    # Save today's portfolio snapshot for the history/trend chart (one row per day, overwritten on each refresh)
+    append_history_snapshot(total_invested, total_current, total_pnl)
+
     # ---------------- EMAIL ALERT CHECK (runs every auto-refresh) ----------------
     if enable_email_alerts and sender_email_input and app_password_input and recipient_email_input:
         sent_any, alert_msgs = check_and_send_52week_alerts(
@@ -625,7 +984,21 @@ elif not df.empty:
 
         st.markdown("<h4 style='color: #76808c; margin-bottom: 10px;'>📈 Terminal Performance Matrix</h4>", unsafe_allow_html=True)
 
-        kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+        # XIRR calculation: prefer actual transaction history if available, else approximate using buy_price/date-less holdings
+        xirr_value = None
+        tx_df_for_xirr = st.session_state.get("transactions_df", pd.DataFrame())
+        if not tx_df_for_xirr.empty:
+            cashflows = []
+            for _, r in tx_df_for_xirr.iterrows():
+                amt = -(r['quantity'] * r['price']) if str(r['txn_type']).upper() == 'BUY' else (r['quantity'] * r['price'])
+                cashflows.append((r['date'].to_pydatetime() if hasattr(r['date'], 'to_pydatetime') else r['date'], amt))
+            cashflows.append((now_ist().replace(tzinfo=None), total_current))
+            try:
+                xirr_value = calculate_xirr(cashflows)
+            except Exception:
+                xirr_value = None
+
+        kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
         with kpi1:
             st.markdown(f'<div class="terminal-card"><div class="metric-title">TOTAL CAPITAL INVESTED</div><div class="metric-value">₹ {total_invested:,.2f}</div><div class="metric-status-blue">● Net Asset Base</div></div>', unsafe_allow_html=True)
         with kpi2:
@@ -636,6 +1009,12 @@ elif not df.empty:
             st.markdown(f'<div class="terminal-card"><div class="metric-title">WEIGHTED RETURNS</div><div class="metric-value" style="color: {"#00ff66" if total_pnl >= 0 else "#ff3333"}">{pnl_sign}{weighted_return:.2f}%</div><div class="{pnl_color_class}">PnL: ₹ {total_pnl:,.2f}</div></div>', unsafe_allow_html=True)
         with kpi4:
             st.markdown(f'<div class="terminal-card"><div class="metric-title">PORTFOLIO WIN RATE</div><div class="metric-value" style="color: #00bfff;">{win_rate:.1f}%</div><div class="metric-status-blue">{profit_stocks} Gainer / {total_stocks - profit_stocks} Loser</div></div>', unsafe_allow_html=True)
+        with kpi5:
+            if xirr_value is not None:
+                xirr_color = "#00ff66" if xirr_value >= 0 else "#ff3333"
+                st.markdown(f'<div class="terminal-card"><div class="metric-title">XIRR (ANNUALIZED)</div><div class="metric-value" style="color:{xirr_color};">{xirr_value:.2f}%</div><div class="metric-status-blue">Based on Transaction Ledger</div></div>', unsafe_allow_html=True)
+            else:
+                st.markdown(f'<div class="terminal-card"><div class="metric-title">XIRR (ANNUALIZED)</div><div class="metric-value" style="color:#76808c; font-size:14px;">No data</div><div class="metric-status-blue">Add transactions in 💼 Ledger tab</div></div>', unsafe_allow_html=True)
 
         if not df_filtered.empty:
             col_left, col_right = st.columns([3, 2])
@@ -651,6 +1030,31 @@ elif not df.empty:
                 fig_pie = go.Figure(data=[go.Pie(labels=df_filtered['share_name'], values=df_filtered['Invested'], hole=.6, hoverinfo="label+percent+value", textinfo="none")])
                 fig_pie.update_layout(plot_bgcolor='#0b0f15', paper_bgcolor='#080c10', font=dict(color='#76808c'), margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h", y=-0.1))
                 st.plotly_chart(fig_pie, use_container_width=True)
+
+            # ---- Sector Allocation + Portfolio History Trend ----
+            col_sec, col_hist = st.columns([2, 3])
+            with col_sec:
+                st.markdown("<h4>🏭 Sector-wise Allocation</h4>", unsafe_allow_html=True)
+                with st.spinner("Fetching sector data..."):
+                    sector_map = fetch_sector_info(tuple(resolved_unique_tickers))
+                df_sector = df_filtered.copy()
+                df_sector['Sector'] = df_sector['resolved_ticker'].map(sector_map).fillna('Unknown')
+                sector_grouped = df_sector.groupby('Sector', as_index=False)['Invested'].sum().sort_values('Invested', ascending=False)
+                fig_sector = go.Figure(data=[go.Pie(labels=sector_grouped['Sector'], values=sector_grouped['Invested'], hole=.5, hoverinfo="label+percent+value", textinfo="percent")])
+                fig_sector.update_layout(plot_bgcolor='#0b0f15', paper_bgcolor='#080c10', font=dict(color='#76808c'), margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h", y=-0.2))
+                st.plotly_chart(fig_sector, use_container_width=True)
+
+            with col_hist:
+                st.markdown("<h4>📈 Portfolio Value Trend (Over Time)</h4>", unsafe_allow_html=True)
+                hist_data = load_history()
+                if len(hist_data) < 2:
+                    st.info("📊 Trend chart will build up as you use the app over multiple days. Each day's snapshot is saved automatically — come back tomorrow to see the trend grow!")
+                else:
+                    fig_hist = go.Figure()
+                    fig_hist.add_trace(go.Scatter(x=hist_data['date'], y=hist_data['total_current'], name='Current Value', line=dict(color='#00bfff')))
+                    fig_hist.add_trace(go.Scatter(x=hist_data['date'], y=hist_data['total_invested'], name='Invested', line=dict(color='#76808c', dash='dot')))
+                    fig_hist.update_layout(plot_bgcolor='#0b0f15', paper_bgcolor='#080c10', font=dict(color='#76808c'), margin=dict(l=10, r=10, t=10, b=10), xaxis=dict(gridcolor='#1f2937'), yaxis=dict(gridcolor='#1f2937', title='₹'), legend=dict(orientation="h", y=-0.2))
+                    st.plotly_chart(fig_hist, use_container_width=True)
 
             st.markdown("<h4>📋 Live Positions (Yahoo Synced Price)</h4>", unsafe_allow_html=True)
             display_df = df_filtered[['share_name', 'resolved_ticker', 'quantity', 'buy_price', 'Simulated_Live', 'high_52w', 'low_52w', 'Invested', 'Current', 'PnL', 'Returns_Pct', 'Action']].copy()
@@ -699,6 +1103,31 @@ elif not df.empty:
     # ==================== MENU 2: ADVANCED ANALYSIS ====================
     elif "Advanced Analysis" in menu or "📈" in menu:
         st.markdown("<h3>📊 Advanced Analysis & Performance Matrix</h3>", unsafe_allow_html=True)
+
+        # ---- Realized vs Unrealized P&L split (from Transaction Ledger) ----
+        st.markdown("<h4>💵 Realized vs Unrealized P&L</h4>", unsafe_allow_html=True)
+        tx_df_adv = st.session_state.get("transactions_df", pd.DataFrame())
+        if tx_df_adv.empty:
+            st.info("💡 No transactions recorded yet. Visit the '💼 Transaction Ledger' tab to log your buys/sells and see Realized vs Unrealized P&L here.")
+        else:
+            realized_df_adv, _ = compute_fifo_realized_pnl(tx_df_adv)
+            total_realized_adv = realized_df_adv['realized_pnl'].sum() if not realized_df_adv.empty else 0
+            total_unrealized_adv = df['PnL'].sum()  # current holdings, from live portfolio file
+            combined_pnl = total_realized_adv + total_unrealized_adv
+
+            ru1, ru2, ru3 = st.columns(3)
+            with ru1:
+                rcolor = "#00ff66" if total_realized_adv >= 0 else "#ff3333"
+                st.markdown(f'<div class="terminal-card"><div class="metric-title">REALIZED P&L (Sold Shares)</div><div class="metric-value" style="color:{rcolor};">₹ {total_realized_adv:,.2f}</div><div class="metric-status-blue">From Transaction Ledger</div></div>', unsafe_allow_html=True)
+            with ru2:
+                ucolor = "#00ff66" if total_unrealized_adv >= 0 else "#ff3333"
+                st.markdown(f'<div class="terminal-card"><div class="metric-title">UNREALIZED P&L (Current Holdings)</div><div class="metric-value" style="color:{ucolor};">₹ {total_unrealized_adv:,.2f}</div><div class="metric-status-blue">From Uploaded Portfolio File</div></div>', unsafe_allow_html=True)
+            with ru3:
+                ccolor = "#00ff66" if combined_pnl >= 0 else "#ff3333"
+                st.markdown(f'<div class="terminal-card"><div class="metric-title">TOTAL P&L (Realized + Unrealized)</div><div class="metric-value" style="color:{ccolor};">₹ {combined_pnl:,.2f}</div><div class="metric-status-blue">Overall Performance</div></div>', unsafe_allow_html=True)
+            st.caption("⚠️ Note: Realized P&L comes from your manually-logged Transaction Ledger, while Unrealized P&L comes from your uploaded portfolio file — keep both updated for an accurate combined total.")
+
+        st.markdown("---")
 
         best_stock = df.loc[df['Returns_Pct'].idxmax()]
         worst_stock = df.loc[df['Returns_Pct'].idxmin()]
