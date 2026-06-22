@@ -40,6 +40,28 @@ def save_overrides(overrides: dict):
     except Exception:
         return False
 
+# Column mapping settings — saved so user doesn't have to re-select every time
+MAPPING_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "column_mappings.json")
+
+def load_mappings() -> dict:
+    """Load saved column mapping preferences. Returns {} if none saved yet."""
+    try:
+        if os.path.exists(MAPPING_FILE):
+            with open(MAPPING_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def save_mappings(mappings: dict):
+    """Persist column mapping preferences to disk."""
+    try:
+        with open(MAPPING_FILE, "w", encoding="utf-8") as f:
+            json.dump(mappings, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
 # 1. PAGE CONFIG + PREMIUM DARK THEME
 st.set_page_config(page_title="AlphaPortfolio Terminal Pro+", layout="wide", initial_sidebar_state="expanded")
 
@@ -106,7 +128,7 @@ st.markdown("""
 # ===================================================================
 # AUTO-REFRESH: refresh live data every 60 seconds
 # ===================================================================
-st_autorefresh(interval=60 * 1000, key="live_price_autorefresh")
+st_autorefresh(interval=1000, key="live_price_autorefresh")
 
 # ===================================================================
 # AUTO-TICKER RESOLVER: Company Name -> correct Yahoo Ticker
@@ -550,9 +572,11 @@ def fetch_sector_info(tickers_list):
 if "alerted_keys" not in st.session_state:
     st.session_state.alerted_keys = set()
 if "manual_ticker_overrides" not in st.session_state:
-    st.session_state.manual_ticker_overrides = load_overrides()  # load any previously saved overrides from disk
+    st.session_state.manual_ticker_overrides = load_overrides()
 if "transactions_df" not in st.session_state:
     st.session_state.transactions_df = load_transactions()
+if "saved_mappings" not in st.session_state:
+    st.session_state.saved_mappings = load_mappings()  # {portfolio: {ticker, qty, price}, tx: {date, name, ticker, type, qty, price}}
 
 # ==================== SIDEBAR (TERMINAL CONTROLS) ====================
 with st.sidebar:
@@ -702,38 +726,105 @@ elif "Transaction Ledger" in menu or "💼" in menu:
 
     # ---------- TAB: Bulk CSV/Excel upload ----------
     with tx_tab2:
-        st.caption("Upload a CSV/Excel with columns: **date, share_name, ticker, txn_type, quantity, price** (txn_type should be BUY or SELL). Column names are matched automatically, case-insensitive.")
-        tx_file = st.file_uploader("Upload transactions file", type=['csv', 'xlsx'], key="tx_bulk_upload")
+        st.caption("Upload your transactions file and map each column below. Click **Save Mapping** to remember your column selections for next time.")
+        tx_file = st.file_uploader("Upload transactions file (CSV or Excel)", type=['csv', 'xlsx'], key="tx_bulk_upload")
         if tx_file is not None:
             try:
                 if tx_file.name.endswith('.csv'):
                     bulk_df = pd.read_csv(tx_file)
                 else:
                     bulk_df = pd.read_excel(tx_file)
-                bulk_df.columns = [c.strip().lower() for c in bulk_df.columns]
+                bulk_df_cols = [c.strip() for c in bulk_df.columns]
+                bulk_df.columns = bulk_df_cols
+                lower_cols = [c.lower() for c in bulk_df_cols]
 
-                col_map = {}
-                for needed in ['date', 'share_name', 'ticker', 'txn_type', 'quantity', 'price']:
-                    matches = [c for c in bulk_df.columns if needed.replace('_', '') in c.replace('_', '').replace(' ', '')]
-                    if matches:
-                        col_map[needed] = matches[0]
+                # Load any previously saved tx mapping
+                saved_tx = st.session_state.saved_mappings.get("transaction", {})
 
-                missing = [c for c in ['date', 'share_name', 'txn_type', 'quantity', 'price'] if c not in col_map]
-                if missing:
-                    st.error(f"⚠️ Could not find required column(s): {', '.join(missing)}. Please rename your file's columns and re-upload.")
+                def _tx_col_idx(saved_key, keywords, fallback=0):
+                    """Pick column index: saved preference > keyword guess > fallback."""
+                    if saved_key in saved_tx and saved_tx[saved_key] in bulk_df_cols:
+                        return bulk_df_cols.index(saved_tx[saved_key])
+                    match = next((i for i, c in enumerate(lower_cols) if any(kw in c for kw in keywords)), fallback)
+                    return match
+
+                saved_tx_notice = " ✅ (saved mapping applied)" if saved_tx else ""
+                st.markdown(f"**🗺️ Transaction Column Mapping{saved_tx_notice}**")
+                st.caption("Select which column in your file corresponds to each field. Unknown / optional columns can be left as 'None'.")
+
+                NONE_OPT = ["(None / Not in file)"]
+                all_tx_opts = NONE_OPT + bulk_df_cols
+
+                tcm1, tcm2, tcm3 = st.columns(3)
+                tcm4, tcm5, tcm6, tcm7 = st.columns([2, 2, 2, 1])
+
+                with tcm1:
+                    date_sel = st.selectbox("📅 Date column", all_tx_opts,
+                                            index=_tx_col_idx("date", ["date","time","day"], 0) + 1)
+                with tcm2:
+                    name_sel = st.selectbox("🏢 Company Name column", all_tx_opts,
+                                            index=_tx_col_idx("share_name", ["name","company","stock","scrip","symbol"], 0) + 1)
+                with tcm3:
+                    ticker_sel = st.selectbox("🌐 Ticker column (optional)", all_tx_opts,
+                                              index=_tx_col_idx("ticker", ["ticker","symbol","isin"], 0) + 1)
+                with tcm4:
+                    type_sel = st.selectbox("🔄 Buy/Sell column", all_tx_opts,
+                                            index=_tx_col_idx("txn_type", ["type","txn","transaction","action","side","buysell","buy/sell"], 0) + 1)
+                with tcm5:
+                    qty_sel = st.selectbox("📦 Quantity column", all_tx_opts,
+                                           index=_tx_col_idx("quantity", ["qty","quantity","shares","units","volume"], 0) + 1)
+                with tcm6:
+                    price_sel = st.selectbox("💰 Price column", all_tx_opts,
+                                             index=_tx_col_idx("price", ["price","rate","cost","avg"], 0) + 1)
+                with tcm7:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    if st.button("💾 Save", use_container_width=True, key="save_tx_mapping", help="Remember these column selections"):
+                        pm = st.session_state.saved_mappings
+                        pm["transaction"] = {
+                            "date": date_sel, "share_name": name_sel, "ticker": ticker_sel,
+                            "txn_type": type_sel, "quantity": qty_sel, "price": price_sel
+                        }
+                        save_mappings(pm)
+                        st.session_state.saved_mappings = pm
+                        st.toast("✅ Transaction mapping saved!", icon="💾")
+
+                # Validate required selections
+                missing_sels = []
+                for field, sel, label in [
+                    ("date", date_sel, "Date"), ("share_name", name_sel, "Company Name"),
+                    ("txn_type", type_sel, "Buy/Sell"), ("quantity", qty_sel, "Quantity"), ("price", price_sel, "Price")
+                ]:
+                    if sel == NONE_OPT[0]:
+                        missing_sels.append(label)
+
+                if missing_sels:
+                    st.warning(f"⚠️ Please select columns for: **{', '.join(missing_sels)}** — then the preview will appear below.")
                 else:
+                    # Build preview DataFrame using user's column selections
+                    raw_name_col = name_sel
+                    raw_ticker_col = ticker_sel if ticker_sel != NONE_OPT[0] else None
+
+                    def _normalize_txn_type(val):
+                        v = str(val).strip().upper()
+                        if v in ('BUY', 'B', 'P', 'PURCHASE'): return 'BUY'
+                        if v in ('SELL', 'S', 'SALE'): return 'SELL'
+                        return v
+
                     preview_df = pd.DataFrame({
-                        "date": pd.to_datetime(bulk_df[col_map['date']], errors='coerce'),
-                        "share_name": bulk_df[col_map['share_name']].astype(str).str.strip(),
-                        "ticker": bulk_df[col_map.get('ticker', col_map['share_name'])].astype(str).str.strip().str.upper() if 'ticker' in col_map else "",
-                        "txn_type": bulk_df[col_map['txn_type']].astype(str).str.strip().str.upper(),
-                        "quantity": pd.to_numeric(bulk_df[col_map['quantity']], errors='coerce'),
-                        "price": pd.to_numeric(bulk_df[col_map['price']], errors='coerce'),
+                        "date": pd.to_datetime(bulk_df[date_sel], errors='coerce'),
+                        "share_name": bulk_df[raw_name_col].astype(str).str.strip(),
+                        "ticker": bulk_df[raw_ticker_col].astype(str).str.strip().str.upper() if raw_ticker_col else "",
+                        "txn_type": bulk_df[type_sel].apply(_normalize_txn_type),
+                        "quantity": pd.to_numeric(bulk_df[qty_sel], errors='coerce'),
+                        "price": pd.to_numeric(bulk_df[price_sel], errors='coerce'),
                     })
                     preview_df = preview_df.dropna(subset=['date', 'share_name', 'quantity', 'price'])
+                    invalid_types = preview_df[~preview_df['txn_type'].isin(['BUY', 'SELL'])]
+                    if not invalid_types.empty:
+                        st.warning(f"⚠️ {len(invalid_types)} rows have unrecognized Buy/Sell values (expected BUY/SELL/B/S): {invalid_types['txn_type'].unique().tolist()} — these will be skipped.")
                     preview_df = preview_df[preview_df['txn_type'].isin(['BUY', 'SELL'])]
 
-                    st.write(f"📋 Preview — {len(preview_df)} valid transaction(s) found:")
+                    st.write(f"📋 **Preview — {len(preview_df)} valid transaction(s) found:**")
                     st.dataframe(preview_df, use_container_width=True, height=200)
 
                     if st.button("✅ Confirm & Add All These Transactions", use_container_width=True):
@@ -816,23 +907,39 @@ elif not df.empty:
     df.columns = df.columns.str.strip()
     all_columns = list(df.columns)
 
-    # Manual Column Mapping interface
-    st.markdown('<div class="map-box">🗺️ <b>Portfolio Column Mapping</b><br><small style="color:#76808c;">Select the correct columns from your file so the system can calculate accurately.</small></div>', unsafe_allow_html=True)
+    # ---- Load saved portfolio mapping (if any) ----
+    saved_pm = st.session_state.saved_mappings.get("portfolio", {})
 
-    map_col1, map_col2, map_col3 = st.columns(3)
+    def _col_idx(saved_key, fallback_keywords, fallback_pos=0):
+        """Pick the index of a column: prefer saved mapping, then keyword match, then fallback position."""
+        if saved_key in saved_pm and saved_pm[saved_key] in all_columns:
+            return all_columns.index(saved_pm[saved_key])
+        match = next((i for i, c in enumerate(all_columns) if c.lower() in fallback_keywords), fallback_pos)
+        return match
+
+    # Portfolio Column Mapping interface
+    pmap_saved_notice = " ✅ (using saved mapping)" if saved_pm else ""
+    st.markdown(f'<div class="map-box">🗺️ <b>Portfolio Column Mapping{pmap_saved_notice}</b><br><small style="color:#76808c;">Select the correct columns from your file. Click <b>Save Mapping</b> to remember this for next time — you won\'t need to select again.</small></div>', unsafe_allow_html=True)
+
+    map_col1, map_col2, map_col3, map_col4 = st.columns([2, 2, 2, 1])
 
     with map_col1:
-        ticker_col = st.selectbox("🌐 Yahoo Symbol (Ticker) column:", all_columns, index=0)
-
+        ticker_col = st.selectbox("🌐 Ticker/Company column:", all_columns,
+                                   index=_col_idx("ticker", [], 0))
     with map_col2:
-        qty_options = ['quantity', 'qty', 'volume', 'shares']
-        default_qty_idx = next((i for i, c in enumerate(all_columns) if c.lower() in qty_options), 0)
-        qty_col = st.selectbox("📦 Quantity column:", all_columns, index=default_qty_idx)
-
+        qty_col = st.selectbox("📦 Quantity column:", all_columns,
+                                index=_col_idx("qty", ['quantity', 'qty', 'volume', 'shares'], 0))
     with map_col3:
-        price_options = ['buy_price', 'buy price', 'avg_price', 'avg price', 'rate', 'price']
-        default_price_idx = next((i for i, c in enumerate(all_columns) if c.lower() in price_options), min(2, len(all_columns)-1))
-        price_col = st.selectbox("💰 Buy Price column:", all_columns, index=default_price_idx)
+        price_col = st.selectbox("💰 Buy Price column:", all_columns,
+                                  index=_col_idx("price", ['buy_price', 'buy price', 'avg_price', 'avg price', 'rate', 'price'], min(2, len(all_columns)-1)))
+    with map_col4:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("💾 Save Mapping", use_container_width=True, help="Remember these column selections so you don't have to pick them again next time"):
+            pm = st.session_state.saved_mappings
+            pm["portfolio"] = {"ticker": ticker_col, "qty": qty_col, "price": price_col}
+            save_mappings(pm)
+            st.session_state.saved_mappings = pm
+            st.toast("✅ Portfolio column mapping saved!", icon="💾")
 
     st.markdown("---")
 
@@ -973,7 +1080,7 @@ elif not df.empty:
 
     # ==================== MENU 1: OVERVIEW ====================
     if "Overview" in menu or "🖥️" in menu:
-        st.caption(f"🔄 Live data auto-refreshes every 60 seconds. Last refreshed: {now_ist().strftime('%H:%M:%S')} IST")
+        st.caption(f"🔄 Live data auto-refreshes every 1 second. Last refreshed: {now_ist().strftime('%H:%M:%S')} IST")
 
         if market_shock != 0:
             st.info(f"⚠️ **Simulation Mode Active:** A {market_shock}% market change is being simulated.")
