@@ -1045,8 +1045,8 @@ elif "Transaction Ledger" in menu or "💼" in menu:
                 fs3.markdown(f'<div class="terminal-card"><div class="metric-title">WIN RATE</div><div class="metric-value" style="color:#58a6ff;">{s_wr:.1f}%</div></div>', unsafe_allow_html=True)
 
             show_rpt = rpt_filtered.copy()
-            show_rpt["buy_date"]  = show_rpt["buy_date"].dt.strftime("%d %b %Y")
-            show_rpt["sell_date"] = show_rpt["sell_date"].dt.strftime("%d %b %Y")
+            show_rpt["buy_date"]  = pd.to_datetime(show_rpt["buy_date"],  errors='coerce').dt.strftime("%d %b %Y")
+            show_rpt["sell_date"] = pd.to_datetime(show_rpt["sell_date"], errors='coerce').dt.strftime("%d %b %Y")
             show_rpt = show_rpt.rename(columns={
                 "share_name":"Company","quantity":"Qty",
                 "buy_date":"Purchase Date","buy_price":"Buy Price","buy_value":"Buy Value",
@@ -1141,8 +1141,8 @@ elif "Transaction Ledger" in menu or "💼" in menu:
 
                     st.markdown(f"#### 📋 Preview — {len(trades)} trades")
                     prev = trades.copy()
-                    prev["buy_date"]  = prev["buy_date"].dt.strftime("%d %b %Y")
-                    prev["sell_date"] = prev["sell_date"].dt.strftime("%d %b %Y")
+                    prev["buy_date"]  = pd.to_datetime(prev["buy_date"],  errors='coerce').dt.strftime("%d %b %Y")
+                    prev["sell_date"] = pd.to_datetime(prev["sell_date"], errors='coerce').dt.strftime("%d %b %Y")
                     st.dataframe(
                         prev[["share_name","quantity","buy_date","buy_price","sell_date","sell_price","realized_pnl","holding_days","tax_term"]]
                         .rename(columns={"share_name":"Company","quantity":"Qty","buy_date":"Buy Date","buy_price":"Buy ₹","sell_date":"Sell Date","sell_price":"Sell ₹","realized_pnl":"P&L (₹)","holding_days":"Days","tax_term":"Term"})
@@ -1196,7 +1196,7 @@ elif "Transaction Ledger" in menu or "💼" in menu:
         else:
             st.markdown("#### 📜 Manual Transaction Ledger")
             disp = tx_df.copy().sort_values('date', ascending=False)
-            disp['date'] = disp['date'].dt.strftime('%d %b %Y')
+            disp['date'] = pd.to_datetime(disp['date'], errors='coerce').dt.strftime('%d %b %Y')
             st.dataframe(disp, use_container_width=True, height=260)
             dl_col, cl_col = st.columns([3,1])
             with dl_col:
