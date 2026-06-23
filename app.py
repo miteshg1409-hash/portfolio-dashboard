@@ -65,63 +65,149 @@ def save_mappings(mappings: dict):
 # 1. PAGE CONFIG + PREMIUM DARK THEME
 st.set_page_config(page_title="AlphaPortfolio Terminal Pro+", layout="wide", initial_sidebar_state="expanded")
 
-# Premium neon UI styling
+# Premium UI styling — improved readability
 st.markdown("""
     <style>
-    .stApp {background-color: #080c10; color: #e1e7ed;}
+    /* ── Base ── */
+    .stApp { background-color: #0d1117; color: #cdd9e5; }
 
+    /* ── Sidebar ── */
+    [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #161b22 0%, #0d1117 100%);
+        border-right: 1px solid #30363d;
+    }
+    [data-testid="stSidebar"] * { color: #cdd9e5 !important; }
+    [data-testid="stSidebar"] .stRadio label { color: #cdd9e5 !important; }
+
+    /* ── Tabs ── */
+    .stTabs [data-baseweb="tab-list"] {
+        background-color: #161b22;
+        border-radius: 8px 8px 0 0;
+        padding: 4px 6px 0 6px;
+        gap: 4px;
+        border-bottom: 2px solid #30363d;
+    }
+    .stTabs [data-baseweb="tab"] {
+        background-color: #21262d;
+        color: #8b949e !important;
+        border-radius: 6px 6px 0 0;
+        padding: 8px 16px;
+        font-weight: 600;
+        font-size: 13px;
+        border: 1px solid #30363d;
+        border-bottom: none;
+        transition: all 0.2s;
+    }
+    .stTabs [aria-selected="true"] {
+        background-color: #1f6feb !important;
+        color: #ffffff !important;
+        border-color: #1f6feb !important;
+    }
+    .stTabs [data-baseweb="tab"]:hover {
+        background-color: #30363d !important;
+        color: #e6edf3 !important;
+    }
+    .stTabs [data-baseweb="tab-panel"] {
+        background-color: #161b22;
+        border: 1px solid #30363d;
+        border-top: none;
+        border-radius: 0 0 8px 8px;
+        padding: 18px;
+    }
+
+    /* ── KPI Cards ── */
     .terminal-card {
-        background: linear-gradient(135deg, #0f141c 0%, #0b0f15 100%);
-        padding: 20px;
-        border-radius: 8px;
-        border: 1px solid #1f2937;
-        box-shadow: 0 4px 25px rgba(0, 0, 0, 0.5);
-        margin-bottom: 15px;
+        background: linear-gradient(135deg, #161b22 0%, #1c2128 100%);
+        padding: 18px 20px;
+        border-radius: 10px;
+        border: 1px solid #30363d;
+        box-shadow: 0 2px 12px rgba(0,0,0,0.4);
+        margin-bottom: 14px;
+        transition: border-color 0.2s;
     }
-    .metric-title { font-size: 11px; color: #76808c; font-weight: 600; text-transform: uppercase; letter-spacing: 1.5px; }
-    .metric-value { font-size: 24px; color: #ffffff; font-weight: 700; margin-top: 5px; font-family: 'Courier New', monospace; }
-    .metric-status-green { color: #00ff66; font-size: 12px; font-weight: 600; margin-top: 5px; }
-    .metric-status-red { color: #ff3333; font-size: 12px; font-weight: 600; margin-top: 5px; }
-    .metric-status-blue { color: #00bfff; font-size: 12px; font-weight: 600; margin-top: 5px; }
+    .terminal-card:hover { border-color: #1f6feb; }
+    .metric-title {
+        font-size: 11px; color: #8b949e; font-weight: 700;
+        text-transform: uppercase; letter-spacing: 1.2px;
+    }
+    .metric-value {
+        font-size: 22px; color: #e6edf3; font-weight: 700;
+        margin-top: 6px; font-family: 'Courier New', monospace;
+    }
+    .metric-status-green { color: #3fb950; font-size: 12px; font-weight: 600; margin-top: 4px; }
+    .metric-status-red   { color: #f85149; font-size: 12px; font-weight: 600; margin-top: 4px; }
+    .metric-status-blue  { color: #58a6ff; font-size: 12px; font-weight: 600; margin-top: 4px; }
 
+    /* ── Alerts / Banners ── */
     .risk-warning {
-        background-color: rgba(255, 51, 51, 0.1);
-        border: 1px solid #ff3333;
-        padding: 12px;
-        border-radius: 6px;
-        color: #ff9999;
-        margin-bottom: 15px;
-        font-size: 13px;
+        background-color: rgba(248, 81, 73, 0.12);
+        border: 1px solid #f85149;
+        padding: 12px 16px; border-radius: 8px;
+        color: #ffa198; margin-bottom: 14px; font-size: 13px; line-height: 1.6;
     }
-
-    .map-box {
-        background-color: #0f141c;
-        padding: 15px;
-        border-radius: 8px;
-        border: 1px dashed #00bfff;
-        margin-bottom: 20px;
-    }
-
     .alert-box-high {
-        background-color: rgba(0, 255, 102, 0.1);
-        border: 1px solid #00ff66;
-        padding: 10px;
-        border-radius: 6px;
-        color: #b6ffd1;
-        margin-bottom: 10px;
-        font-size: 13px;
+        background-color: rgba(63, 185, 80, 0.12);
+        border: 1px solid #3fb950;
+        padding: 10px 14px; border-radius: 8px;
+        color: #56d364; margin-bottom: 10px; font-size: 13px;
     }
     .alert-box-low {
-        background-color: rgba(255, 51, 51, 0.1);
-        border: 1px solid #ff3333;
-        padding: 10px;
-        border-radius: 6px;
-        color: #ff9999;
-        margin-bottom: 10px;
-        font-size: 13px;
+        background-color: rgba(248, 81, 73, 0.12);
+        border: 1px solid #f85149;
+        padding: 10px 14px; border-radius: 8px;
+        color: #ffa198; margin-bottom: 10px; font-size: 13px;
+    }
+    .map-box {
+        background-color: #1c2128;
+        padding: 14px 18px; border-radius: 8px;
+        border: 1px dashed #58a6ff; margin-bottom: 18px; color: #cdd9e5;
     }
 
-    [data-testid="stSidebar"] { background-color: #0b0f15; border-right: 1px solid #1f2937; }
+    /* ── Inputs & Selectboxes ── */
+    .stTextInput > div > div > input,
+    .stSelectbox > div > div > div {
+        background-color: #21262d !important;
+        color: #e6edf3 !important;
+        border: 1px solid #30363d !important;
+        border-radius: 6px !important;
+    }
+    .stTextInput > div > div > input:focus {
+        border-color: #58a6ff !important;
+        box-shadow: 0 0 0 3px rgba(88,166,255,0.15) !important;
+    }
+
+    /* ── Dataframe / Table ── */
+    .stDataFrame { border: 1px solid #30363d !important; border-radius: 8px; }
+
+    /* ── Buttons ── */
+    .stButton > button {
+        background-color: #21262d; color: #cdd9e5;
+        border: 1px solid #30363d; border-radius: 6px;
+        font-weight: 600; transition: all 0.2s;
+    }
+    .stButton > button:hover {
+        background-color: #1f6feb; color: #ffffff; border-color: #1f6feb;
+    }
+
+    /* ── Autocomplete dropdown ── */
+    .autocomplete-item {
+        padding: 10px 14px; border-radius: 6px;
+        background: #21262d; border: 1px solid #30363d;
+        cursor: pointer; margin-bottom: 6px; color: #e6edf3;
+        transition: background 0.15s;
+    }
+    .autocomplete-item:hover { background: #1f6feb; color: #fff; }
+    .autocomplete-label { font-weight: 600; font-size: 14px; }
+    .autocomplete-sub   { font-size: 11px; color: #8b949e; margin-top: 2px; }
+
+    /* ── Scrollbar ── */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #0d1117; }
+    ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #58a6ff; }
+
+    /* ── Section headings ── */
+    h1, h2, h3, h4 { color: #e6edf3 !important; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -655,40 +741,124 @@ def color_pnl(val):
     return f'color: #00ff66; font-weight: bold;' if val >= 0 else f'color: #ff3333; font-weight: bold;'
 
 # ==================== SEARCH ANY STOCK TAB (works even without a file) ====================
+@st.cache_data(ttl=10, show_spinner=False)
+def fetch_search_suggestions(query: str):
+    """Fetch live company name + ticker suggestions from Yahoo Finance search API
+    as the user types — returns list of {name, ticker, exchange, type} dicts."""
+    if not query or len(query.strip()) < 2:
+        return []
+    suggestions = []
+    try:
+        import requests
+        url = "https://query2.finance.yahoo.com/v1/finance/search"
+        resp = requests.get(url,
+            params={"q": query, "quotesCount": 10, "newsCount": 0},
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=4)
+        if resp.status_code == 200:
+            for q in resp.json().get("quotes", []):
+                if q.get("quoteType") not in ("EQUITY", "ETF", "MUTUALFUND", None):
+                    continue
+                suggestions.append({
+                    "label": f"{q.get('longname') or q.get('shortname') or q.get('symbol')}  —  {q.get('symbol')}  [{q.get('exchange','')}]",
+                    "ticker": q.get("symbol", ""),
+                    "name": q.get("longname") or q.get("shortname") or q.get("symbol", ""),
+                })
+    except Exception:
+        pass
+    if not suggestions:
+        try:
+            s = yf.Search(query, max_results=10)
+            for q in (s.quotes or []):
+                suggestions.append({
+                    "label": f"{q.get('longname') or q.get('shortname') or q.get('symbol')}  —  {q.get('symbol')}",
+                    "ticker": q.get("symbol", ""),
+                    "name": q.get("longname") or q.get("shortname") or q.get("symbol", ""),
+                })
+        except Exception:
+            pass
+    return suggestions[:10]
+
+
 if "Search Any Stock" in menu or "🔎" in menu:
     st.markdown("<h3>🔎 Search Any Stock</h3>", unsafe_allow_html=True)
-    st.caption("Type a company name (e.g. 'Tata Motors') or a ticker (e.g. 'AAPL', 'INFY.NS') to get its live price and 52-week range — independent of your uploaded portfolio.")
+    st.caption("Type a few letters of the company name or ticker — suggestions will appear automatically. Click one to load its live price and 52-week data.")
 
-    search_query = st.text_input("Company name or ticker:", placeholder="e.g. Reliance, Apple, INFY.NS")
+    # ── Autocomplete: text input + live dropdown ──
+    if "search_selected_ticker" not in st.session_state:
+        st.session_state.search_selected_ticker = ""
+    if "search_selected_name" not in st.session_state:
+        st.session_state.search_selected_name = ""
 
-    if search_query:
-        with st.spinner(f"Searching for '{search_query}'..."):
-            result = search_any_stock(search_query)
+    search_query = st.text_input(
+        "🔍 Type company name or ticker (e.g. Reliance, TCS, Apple, INFY):",
+        value=st.session_state.get("search_box_text", ""),
+        placeholder="e.g. Reliance, Infosys, Tata Motors, AAPL…",
+        key="search_box_input"
+    )
+    st.session_state["search_box_text"] = search_query
+
+    # Fetch and show suggestions while typing (min 2 chars, no confirmed selection yet)
+    confirmed_ticker = st.session_state.search_selected_ticker
+
+    if search_query and len(search_query) >= 2 and not confirmed_ticker:
+        with st.spinner("Searching..."):
+            suggestions = fetch_search_suggestions(search_query)
+
+        if suggestions:
+            st.caption(f"**{len(suggestions)} suggestion(s) found** — click one to select:")
+            for s in suggestions:
+                if st.button(s["label"], key=f"sugg_{s['ticker']}", use_container_width=True):
+                    st.session_state.search_selected_ticker = s["ticker"]
+                    st.session_state.search_selected_name = s["name"]
+                    st.session_state["search_box_text"] = s["name"]
+                    st.rerun()
+        else:
+            st.info("No suggestions found — try a different spelling or type the exact Yahoo ticker (e.g. RELIANCE.NS).")
+
+    elif confirmed_ticker:
+        # Clear selection button
+        cl1, cl2 = st.columns([4,1])
+        with cl2:
+            if st.button("✖ Clear", use_container_width=True):
+                st.session_state.search_selected_ticker = ""
+                st.session_state.search_selected_name = ""
+                st.session_state["search_box_text"] = ""
+                st.rerun()
+
+        with st.spinner(f"Loading data for {confirmed_ticker}..."):
+            result = search_any_stock(confirmed_ticker)
 
         if result is None:
-            st.error(f"⚠️ Could not find a matching stock for '{search_query}'. Try the exact Yahoo ticker instead (e.g. TCS.NS).")
+            st.error(f"⚠️ Could not fetch data for {confirmed_ticker}. Try again.")
         else:
-            st.markdown(f"#### {result['company_name']} ({result['ticker']})")
+            st.markdown(f"#### {result['company_name']}  `{result['ticker']}`")
             sc1, sc2, sc3 = st.columns(3)
             with sc1:
                 st.markdown(f'<div class="terminal-card"><div class="metric-title">LIVE PRICE</div><div class="metric-value">{result["currency"]} {result["live_price"]:,.2f}</div></div>', unsafe_allow_html=True)
             with sc2:
                 high_txt = f'{result["currency"]} {result["high_52w"]:,.2f}' if result["high_52w"] else "N/A"
-                st.markdown(f'<div class="terminal-card"><div class="metric-title">52-WEEK HIGH</div><div class="metric-value" style="color:#00ff66;">{high_txt}</div></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="terminal-card"><div class="metric-title">52-WEEK HIGH</div><div class="metric-value" style="color:#3fb950;">{high_txt}</div></div>', unsafe_allow_html=True)
             with sc3:
                 low_txt = f'{result["currency"]} {result["low_52w"]:,.2f}' if result["low_52w"] else "N/A"
-                st.markdown(f'<div class="terminal-card"><div class="metric-title">52-WEEK LOW</div><div class="metric-value" style="color:#ff3333;">{low_txt}</div></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="terminal-card"><div class="metric-title">52-WEEK LOW</div><div class="metric-value" style="color:#f85149;">{low_txt}</div></div>', unsafe_allow_html=True)
 
             if not result["history"].empty:
-                fig_search = go.Figure(data=[go.Scatter(x=result["history"].index, y=result["history"]['Close'], line=dict(color='#00bfff'))])
+                fig_search = go.Figure(data=[go.Scatter(
+                    x=result["history"].index, y=result["history"]['Close'],
+                    line=dict(color='#58a6ff'), fill='tozeroy',
+                    fillcolor='rgba(88,166,255,0.08)'
+                )])
                 fig_search.update_layout(
-                    plot_bgcolor='#0b0f15', paper_bgcolor='#080c10', font=dict(color='#76808c'),
-                    margin=dict(l=10, r=10, t=30, b=10), title="1-Year Price Trend",
-                    xaxis=dict(gridcolor='#1f2937'), yaxis=dict(gridcolor='#1f2937')
+                    plot_bgcolor='#161b22', paper_bgcolor='#0d1117',
+                    font=dict(color='#8b949e'),
+                    margin=dict(l=10, r=10, t=36, b=10),
+                    title=dict(text="1-Year Price Trend", font=dict(color='#e6edf3')),
+                    xaxis=dict(gridcolor='#21262d', color='#8b949e'),
+                    yaxis=dict(gridcolor='#21262d', color='#8b949e')
                 )
                 st.plotly_chart(fig_search, use_container_width=True)
     else:
-        st.info("💡 Enter a company name or ticker above to see its live price and 52-week range.")
+        st.info("💡 Start typing above — company suggestions will appear automatically as you type.")
 
 # ==================== TRANSACTION LEDGER TAB ====================
 elif "Transaction Ledger" in menu or "💼" in menu:
@@ -974,9 +1144,9 @@ elif "Transaction Ledger" in menu or "💼" in menu:
                     text=top10["realized_pnl"].apply(lambda v: f"₹{v:,.0f}"),
                     textposition="auto"
                 ))
-                fig_gl.update_layout(plot_bgcolor='#0b0f15', paper_bgcolor='#080c10',
-                    font=dict(color='#76808c'), margin=dict(l=10,r=10,t=10,b=10),
-                    xaxis=dict(gridcolor='#1f2937'), yaxis=dict(gridcolor='#1f2937'))
+                fig_gl.update_layout(plot_bgcolor='#161b22', paper_bgcolor='#0d1117',
+                    font=dict(color='#8b949e'), margin=dict(l=10,r=10,t=10,b=10),
+                    xaxis=dict(gridcolor='#21262d'), yaxis=dict(gridcolor='#21262d'))
                 st.plotly_chart(fig_gl, use_container_width=True)
 
             with ch2:
@@ -987,7 +1157,7 @@ elif "Transaction Ledger" in menu or "💼" in menu:
                     hole=0.5,
                     marker=dict(colors=["#00bfff","#00ff66"])
                 ))
-                fig_tax.update_layout(paper_bgcolor='#080c10', font=dict(color='#76808c'),
+                fig_tax.update_layout(paper_bgcolor='#0d1117', font=dict(color='#8b949e'),
                     margin=dict(l=10,r=10,t=10,b=10))
                 st.plotly_chart(fig_tax, use_container_width=True)
 
@@ -1003,9 +1173,9 @@ elif "Transaction Ledger" in menu or "💼" in menu:
                 text=monthly["realized_pnl"].apply(lambda v: f"₹{v:,.0f}"),
                 textposition="auto"
             ))
-            fig_m.update_layout(plot_bgcolor='#0b0f15', paper_bgcolor='#080c10',
-                font=dict(color='#76808c'), margin=dict(l=10,r=10,t=10,b=10),
-                xaxis=dict(gridcolor='#1f2937'), yaxis=dict(gridcolor='#1f2937', title="P&L (₹)"))
+            fig_m.update_layout(plot_bgcolor='#161b22', paper_bgcolor='#0d1117',
+                font=dict(color='#8b949e'), margin=dict(l=10,r=10,t=10,b=10),
+                xaxis=dict(gridcolor='#21262d'), yaxis=dict(gridcolor='#21262d', title="P&L (₹)"))
             st.plotly_chart(fig_m, use_container_width=True)
 
             # Full trade table
@@ -1260,13 +1430,13 @@ elif not df.empty:
                 st.markdown("<h4>📊 Stock Performance Chart (Net PnL Impact)</h4>", unsafe_allow_html=True)
                 colors = ['#00ff66' if val >= 0 else '#ff3333' for val in df_filtered['PnL']]
                 fig_bar = go.Figure(data=[go.Bar(x=df_filtered['share_name'], y=df_filtered['PnL'], marker_color=colors, text=df_filtered['PnL'].apply(lambda x: f"₹{x:,.0f}"), textposition='auto')])
-                fig_bar.update_layout(plot_bgcolor='#0b0f15', paper_bgcolor='#080c10', font=dict(color='#76808c'), margin=dict(l=10, r=10, t=10, b=10), xaxis=dict(showgrid=False), yaxis=dict(gridcolor='#1f2937'))
+                fig_bar.update_layout(plot_bgcolor='#161b22', paper_bgcolor='#0d1117', font=dict(color='#8b949e'), margin=dict(l=10, r=10, t=10, b=10), xaxis=dict(showgrid=False), yaxis=dict(gridcolor='#21262d'))
                 st.plotly_chart(fig_bar, use_container_width=True)
 
             with col_right:
                 st.markdown("<h4>📦 Asset Allocation Weightage (Weight %)</h4>", unsafe_allow_html=True)
                 fig_pie = go.Figure(data=[go.Pie(labels=df_filtered['share_name'], values=df_filtered['Invested'], hole=.6, hoverinfo="label+percent+value", textinfo="none")])
-                fig_pie.update_layout(plot_bgcolor='#0b0f15', paper_bgcolor='#080c10', font=dict(color='#76808c'), margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h", y=-0.1))
+                fig_pie.update_layout(plot_bgcolor='#161b22', paper_bgcolor='#0d1117', font=dict(color='#8b949e'), margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h", y=-0.1))
                 st.plotly_chart(fig_pie, use_container_width=True)
 
             # ---- Sector Allocation + Portfolio History Trend ----
@@ -1279,7 +1449,7 @@ elif not df.empty:
                 df_sector['Sector'] = df_sector['resolved_ticker'].map(sector_map).fillna('Unknown')
                 sector_grouped = df_sector.groupby('Sector', as_index=False)['Invested'].sum().sort_values('Invested', ascending=False)
                 fig_sector = go.Figure(data=[go.Pie(labels=sector_grouped['Sector'], values=sector_grouped['Invested'], hole=.5, hoverinfo="label+percent+value", textinfo="percent")])
-                fig_sector.update_layout(plot_bgcolor='#0b0f15', paper_bgcolor='#080c10', font=dict(color='#76808c'), margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h", y=-0.2))
+                fig_sector.update_layout(plot_bgcolor='#161b22', paper_bgcolor='#0d1117', font=dict(color='#8b949e'), margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h", y=-0.2))
                 st.plotly_chart(fig_sector, use_container_width=True)
 
             with col_hist:
@@ -1291,7 +1461,7 @@ elif not df.empty:
                     fig_hist = go.Figure()
                     fig_hist.add_trace(go.Scatter(x=hist_data['date'], y=hist_data['total_current'], name='Current Value', line=dict(color='#00bfff')))
                     fig_hist.add_trace(go.Scatter(x=hist_data['date'], y=hist_data['total_invested'], name='Invested', line=dict(color='#76808c', dash='dot')))
-                    fig_hist.update_layout(plot_bgcolor='#0b0f15', paper_bgcolor='#080c10', font=dict(color='#76808c'), margin=dict(l=10, r=10, t=10, b=10), xaxis=dict(gridcolor='#1f2937'), yaxis=dict(gridcolor='#1f2937', title='₹'), legend=dict(orientation="h", y=-0.2))
+                    fig_hist.update_layout(plot_bgcolor='#161b22', paper_bgcolor='#0d1117', font=dict(color='#8b949e'), margin=dict(l=10, r=10, t=10, b=10), xaxis=dict(gridcolor='#21262d'), yaxis=dict(gridcolor='#21262d', title='₹'), legend=dict(orientation="h", y=-0.2))
                     st.plotly_chart(fig_hist, use_container_width=True)
 
             st.markdown("<h4>📋 Live Positions (Yahoo Synced Price)</h4>", unsafe_allow_html=True)
@@ -1390,13 +1560,13 @@ elif not df.empty:
                 values='Invested', color='Returns_Pct',
                 color_continuous_scale='RdYlGn', color_continuous_midpoint=0, template="plotly_dark"
             )
-            fig_tree.update_layout(margin=dict(l=10, r=10, t=10, b=10), paper_bgcolor='#080c10')
+            fig_tree.update_layout(margin=dict(l=10, r=10, t=10, b=10), paper_bgcolor='#0d1117')
             st.plotly_chart(fig_tree, use_container_width=True)
 
         with col_adv2:
             st.markdown("<h4>🔵 Risk vs Return Scatter Map</h4>", unsafe_allow_html=True)
             fig_scatter = px.scatter(df, x='Invested', y='Returns_Pct', size='quantity', color='PnL', hover_name='share_name', color_continuous_scale='RdYlGn', template="plotly_dark", size_max=40)
-            fig_scatter.update_layout(plot_bgcolor='#0b0f15', paper_bgcolor='#080c10', font=dict(color='#76808c'), margin=dict(l=10, r=10, t=10, b=10), xaxis=dict(title="Investment (₹)", gridcolor='#1f2937'), yaxis=dict(title="Returns (%)", gridcolor='#1f2937'))
+            fig_scatter.update_layout(plot_bgcolor='#161b22', paper_bgcolor='#0d1117', font=dict(color='#8b949e'), margin=dict(l=10, r=10, t=10, b=10), xaxis=dict(title="Investment (₹)", gridcolor='#21262d'), yaxis=dict(title="Returns (%)", gridcolor='#21262d'))
             st.plotly_chart(fig_scatter, use_container_width=True)
 
     # ==================== MENU 3: SINGLE STOCK DEEP-DIVE ====================
@@ -1440,7 +1610,7 @@ elif not df.empty:
                 }
             }
         ))
-        fig_gauge.update_layout(paper_bgcolor='#080c10', font=dict(color='#76808c'), margin=dict(l=20, r=20, t=40, b=20))
+        fig_gauge.update_layout(paper_bgcolor='#0d1117', font=dict(color='#8b949e'), margin=dict(l=20, r=20, t=40, b=20))
         st.plotly_chart(fig_gauge, use_container_width=True)
 else:
     st.info("💡 Terminal is ready! Please upload your file (CSV or Excel), or use the '🔎 Search Any Stock' tab in the sidebar to look up any stock without uploading a file.")
