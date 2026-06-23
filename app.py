@@ -884,138 +884,275 @@ if "Search Any Stock" in menu or "🔎" in menu:
 
 # ==================== TRANSACTION LEDGER TAB ====================
 elif "Transaction Ledger" in menu or "💼" in menu:
-    st.markdown("<h3>💼 Transaction Ledger — Buy/Sell Tracking</h3>", unsafe_allow_html=True)
+    st.markdown("<h2 style='color:#e6edf3;'>💼 Transaction Ledger & P&L Analytics</h2>", unsafe_allow_html=True)
 
-    # Two formats supported:
-    # FORMAT A: "Row per trade"  — one row has Purchase Date, Purchase Price, Sell Date, Sell Price (your file)
-    # FORMAT B: "Row per transaction" — separate BUY row and SELL row (classic ledger style)
-
-    tx_tab1, tx_tab2, tx_tab3, tx_tab4 = st.tabs([
-        "📤 Upload Trade File (Row-per-Trade)",
-        "➕ Manual Entry (Row-per-Transaction)",
-        "📜 Full Ledger & P&L",
-        "📊 P&L Dashboard"
+    tx_tab4, tx_tab1, tx_tab2, tx_tab3 = st.tabs([
+        "📊 P&L Dashboard",
+        "📤 Upload Trade File",
+        "➕ Manual Entry",
+        "📜 Full Ledger",
     ])
 
     # ================================================================
-    # TAB 1: ROW-PER-TRADE UPLOAD (your actual file format)
+    # TAB 1 (shown first): P&L DASHBOARD
+    # ================================================================
+    with tx_tab4:
+        rpt = st.session_state.get("rpt_trades", pd.DataFrame())
+        if rpt.empty:
+            st.markdown("""
+            <div style='text-align:center; padding:60px 20px;'>
+                <div style='font-size:64px;'>📂</div>
+                <h3 style='color:#8b949e; margin-top:16px;'>No trades loaded yet</h3>
+                <p style='color:#6e7681;'>Go to the <b>📤 Upload Trade File</b> tab, upload your broker's P&L export, map the columns, and click Confirm.</p>
+            </div>""", unsafe_allow_html=True)
+        else:
+            total_buy   = rpt["buy_value"].sum()
+            total_sell  = rpt["sell_value"].sum()
+            total_pnl   = rpt["realized_pnl"].sum()
+            stcg_df     = rpt[rpt["tax_term"] == "STCG (<1yr)"]
+            ltcg_df     = rpt[rpt["tax_term"] == "LTCG (>1yr)"]
+            stcg_pnl    = stcg_df["realized_pnl"].sum()
+            ltcg_pnl    = ltcg_df["realized_pnl"].sum()
+            profit_trades = (rpt["realized_pnl"] > 0).sum()
+            loss_trades   = (rpt["realized_pnl"] < 0).sum()
+            win_rate_tx   = profit_trades / len(rpt) * 100 if len(rpt) > 0 else 0
+            avg_win       = rpt[rpt["realized_pnl"] > 0]["realized_pnl"].mean() if profit_trades > 0 else 0
+            avg_loss      = rpt[rpt["realized_pnl"] < 0]["realized_pnl"].mean() if loss_trades > 0 else 0
+            best_trade    = rpt.loc[rpt["realized_pnl"].idxmax()] if len(rpt) > 0 else None
+            worst_trade   = rpt.loc[rpt["realized_pnl"].idxmin()] if len(rpt) > 0 else None
+            est_stcg_tax  = max(0, stcg_pnl) * 0.20
+            est_ltcg_tax  = max(0, ltcg_pnl - 100000) * 0.125 if ltcg_pnl > 100000 else 0
+            total_tax     = est_stcg_tax + est_ltcg_tax
+
+            # ── Row 1: Main KPIs ──
+            st.markdown("### 📈 Realized P&L Summary")
+            k1,k2,k3,k4,k5,k6 = st.columns(6)
+            pnl_color = "#3fb950" if total_pnl >= 0 else "#f85149"
+            k1.markdown(f'<div class="terminal-card"><div class="metric-title">TOTAL REALIZED P&L</div><div class="metric-value" style="color:{pnl_color};">₹{total_pnl:,.0f}</div></div>', unsafe_allow_html=True)
+            k2.markdown(f'<div class="terminal-card"><div class="metric-title">TOTAL INVESTED (Buy)</div><div class="metric-value">₹{total_buy:,.0f}</div></div>', unsafe_allow_html=True)
+            k3.markdown(f'<div class="terminal-card"><div class="metric-title">TOTAL RECEIVED (Sell)</div><div class="metric-value">₹{total_sell:,.0f}</div></div>', unsafe_allow_html=True)
+            k4.markdown(f'<div class="terminal-card"><div class="metric-title">WIN RATE</div><div class="metric-value" style="color:#58a6ff;">{win_rate_tx:.1f}%</div><div class="metric-status-blue">{profit_trades}W / {loss_trades}L / {len(rpt)}T</div></div>', unsafe_allow_html=True)
+            k5.markdown(f'<div class="terminal-card"><div class="metric-title">STCG P&L</div><div class="metric-value" style="color:{"#3fb950" if stcg_pnl>=0 else "#f85149"};">₹{stcg_pnl:,.0f}</div><div class="metric-status-blue">Tax ₹{est_stcg_tax:,.0f}</div></div>', unsafe_allow_html=True)
+            k6.markdown(f'<div class="terminal-card"><div class="metric-title">LTCG P&L</div><div class="metric-value" style="color:{"#3fb950" if ltcg_pnl>=0 else "#f85149"};">₹{ltcg_pnl:,.0f}</div><div class="metric-status-blue">Tax ₹{est_ltcg_tax:,.0f}</div></div>', unsafe_allow_html=True)
+
+            # ── Row 2: Tax + Avg Win/Loss + Best/Worst ──
+            st.markdown("---")
+            b1,b2,b3,b4 = st.columns(4)
+            b1.markdown(f'<div class="terminal-card"><div class="metric-title">TOTAL EST. TAX LIABILITY</div><div class="metric-value" style="color:#e3b341;">₹{total_tax:,.0f}</div><div class="metric-status-blue">STCG+LTCG combined</div></div>', unsafe_allow_html=True)
+            b2.markdown(f'<div class="terminal-card"><div class="metric-title">AVG WINNING TRADE</div><div class="metric-value" style="color:#3fb950;">₹{avg_win:,.0f}</div></div>', unsafe_allow_html=True)
+            b3.markdown(f'<div class="terminal-card"><div class="metric-title">AVG LOSING TRADE</div><div class="metric-value" style="color:#f85149;">₹{avg_loss:,.0f}</div></div>', unsafe_allow_html=True)
+            rr = abs(avg_win/avg_loss) if avg_loss != 0 else 0
+            b4.markdown(f'<div class="terminal-card"><div class="metric-title">RISK:REWARD RATIO</div><div class="metric-value" style="color:#58a6ff;">1 : {rr:.2f}</div></div>', unsafe_allow_html=True)
+
+            # ── Best / Worst Trade highlight ──
+            if best_trade is not None and worst_trade is not None:
+                bw1, bw2 = st.columns(2)
+                with bw1:
+                    st.markdown(f"""<div class="alert-box-high">
+                        🏆 <b>BEST TRADE</b> — {best_trade['share_name']}<br>
+                        Buy ₹{best_trade['buy_price']:,.2f} → Sell ₹{best_trade['sell_price']:,.2f} × {best_trade['quantity']:.0f} shares<br>
+                        <b style='font-size:18px;'>P&L: ₹{best_trade['realized_pnl']:,.2f}</b> &nbsp;|&nbsp; {best_trade['tax_term']}
+                    </div>""", unsafe_allow_html=True)
+                with bw2:
+                    st.markdown(f"""<div class="alert-box-low">
+                        📉 <b>WORST TRADE</b> — {worst_trade['share_name']}<br>
+                        Buy ₹{worst_trade['buy_price']:,.2f} → Sell ₹{worst_trade['sell_price']:,.2f} × {worst_trade['quantity']:.0f} shares<br>
+                        <b style='font-size:18px;'>P&L: ₹{worst_trade['realized_pnl']:,.2f}</b> &nbsp;|&nbsp; {worst_trade['tax_term']}
+                    </div>""", unsafe_allow_html=True)
+
+            st.caption("⚠️ Tax estimate is indicative only. LTCG exempt up to ₹1 lakh/year. Consult a CA for actual filing.")
+            st.markdown("---")
+
+            # ── Charts Row 1: Monthly trend + Cumulative P&L ──
+            ch1, ch2 = st.columns(2)
+            with ch1:
+                st.markdown("#### 📅 Monthly Realized P&L")
+                rpt_m = rpt.copy()
+                rpt_m["month"] = rpt_m["sell_date"].dt.to_period("M").astype(str)
+                monthly = rpt_m.groupby("month")["realized_pnl"].sum().reset_index()
+                fig_m = go.Figure(go.Bar(
+                    x=monthly["month"], y=monthly["realized_pnl"],
+                    marker_color=["#3fb950" if v >= 0 else "#f85149" for v in monthly["realized_pnl"]],
+                    text=monthly["realized_pnl"].apply(lambda v: f"₹{v:,.0f}"),
+                    textposition="auto"
+                ))
+                fig_m.update_layout(plot_bgcolor='#161b22', paper_bgcolor='#0d1117',
+                    font=dict(color='#8b949e'), margin=dict(l=10,r=10,t=10,b=10),
+                    xaxis=dict(gridcolor='#21262d', tickangle=-45),
+                    yaxis=dict(gridcolor='#21262d', title="P&L (₹)"))
+                st.plotly_chart(fig_m, use_container_width=True)
+
+            with ch2:
+                st.markdown("#### 📈 Cumulative P&L Over Time")
+                rpt_sorted = rpt.sort_values("sell_date").copy()
+                rpt_sorted["cumulative_pnl"] = rpt_sorted["realized_pnl"].cumsum()
+                fig_cum = go.Figure()
+                fig_cum.add_trace(go.Scatter(
+                    x=rpt_sorted["sell_date"], y=rpt_sorted["cumulative_pnl"],
+                    line=dict(color='#58a6ff', width=2), fill='tozeroy',
+                    fillcolor='rgba(88,166,255,0.08)', name="Cumulative P&L"
+                ))
+                fig_cum.add_hline(y=0, line_dash="dot", line_color="#8b949e")
+                fig_cum.update_layout(plot_bgcolor='#161b22', paper_bgcolor='#0d1117',
+                    font=dict(color='#8b949e'), margin=dict(l=10,r=10,t=10,b=10),
+                    xaxis=dict(gridcolor='#21262d'),
+                    yaxis=dict(gridcolor='#21262d', title="Cumulative P&L (₹)"),
+                    showlegend=False)
+                st.plotly_chart(fig_cum, use_container_width=True)
+
+            # ── Charts Row 2: Top Gainers/Losers + STCG/LTCG pie ──
+            ch3, ch4 = st.columns(2)
+            with ch3:
+                st.markdown("#### 🏆 Top Gainers & Losers (by stock)")
+                by_stock = rpt.groupby("share_name", as_index=False)["realized_pnl"].sum().sort_values("realized_pnl")
+                top_n = pd.concat([by_stock.head(5), by_stock.tail(5)]).drop_duplicates()
+                fig_gl = go.Figure(go.Bar(
+                    x=top_n["realized_pnl"], y=top_n["share_name"], orientation='h',
+                    marker_color=["#3fb950" if v >= 0 else "#f85149" for v in top_n["realized_pnl"]],
+                    text=top_n["realized_pnl"].apply(lambda v: f"₹{v:,.0f}"), textposition="auto"
+                ))
+                fig_gl.update_layout(plot_bgcolor='#161b22', paper_bgcolor='#0d1117',
+                    font=dict(color='#8b949e'), margin=dict(l=10,r=10,t=10,b=10),
+                    xaxis=dict(gridcolor='#21262d'), yaxis=dict(gridcolor='#21262d'))
+                st.plotly_chart(fig_gl, use_container_width=True)
+
+            with ch4:
+                st.markdown("#### 🥧 STCG vs LTCG Breakdown")
+                fig_tax = go.Figure(go.Pie(
+                    labels=["STCG (<1yr)", "LTCG (>1yr)"],
+                    values=[max(0.01,len(stcg_df)), max(0.01,len(ltcg_df))],
+                    hole=0.55,
+                    marker=dict(colors=["#58a6ff","#3fb950"]),
+                    textinfo="label+percent"
+                ))
+                fig_tax.update_layout(paper_bgcolor='#0d1117', font=dict(color='#8b949e'),
+                    margin=dict(l=10,r=10,t=10,b=10))
+                st.plotly_chart(fig_tax, use_container_width=True)
+
+            # ── Stock-wise filter + detail table ──
+            st.markdown("---")
+            st.markdown("#### 🔍 Stock-wise P&L Filter")
+            all_stocks = ["All Stocks"] + sorted(rpt["share_name"].unique().tolist())
+            sel_stock = st.selectbox("Select a specific stock to see its trades:", all_stocks)
+            rpt_filtered = rpt if sel_stock == "All Stocks" else rpt[rpt["share_name"] == sel_stock]
+
+            if sel_stock != "All Stocks":
+                fs1, fs2, fs3 = st.columns(3)
+                spnl = rpt_filtered["realized_pnl"].sum()
+                fs1.markdown(f'<div class="terminal-card"><div class="metric-title">{sel_stock} — TOTAL P&L</div><div class="metric-value" style="color:{"#3fb950" if spnl>=0 else "#f85149"};">₹{spnl:,.2f}</div></div>', unsafe_allow_html=True)
+                fs2.markdown(f'<div class="terminal-card"><div class="metric-title">TRADES</div><div class="metric-value">{len(rpt_filtered)}</div></div>', unsafe_allow_html=True)
+                s_wr = (rpt_filtered["realized_pnl"]>0).sum()/len(rpt_filtered)*100
+                fs3.markdown(f'<div class="terminal-card"><div class="metric-title">WIN RATE</div><div class="metric-value" style="color:#58a6ff;">{s_wr:.1f}%</div></div>', unsafe_allow_html=True)
+
+            show_rpt = rpt_filtered.copy()
+            show_rpt["buy_date"]  = show_rpt["buy_date"].dt.strftime("%d %b %Y")
+            show_rpt["sell_date"] = show_rpt["sell_date"].dt.strftime("%d %b %Y")
+            show_rpt = show_rpt.rename(columns={
+                "share_name":"Company","quantity":"Qty",
+                "buy_date":"Purchase Date","buy_price":"Buy Price","buy_value":"Buy Value",
+                "sell_date":"Sell Date","sell_price":"Sell Price","sell_value":"Sell Value",
+                "realized_pnl":"P&L (₹)","holding_days":"Days Held","tax_term":"Tax Term"
+            })
+            dcols = [c for c in ["Company","Qty","Purchase Date","Buy Price","Buy Value",
+                                  "Sell Date","Sell Price","Sell Value","P&L (₹)","Days Held","Tax Term"] if c in show_rpt.columns]
+            st.dataframe(
+                show_rpt[dcols].style
+                .format({"Buy Price":"₹{:,.2f}","Buy Value":"₹{:,.2f}",
+                         "Sell Price":"₹{:,.2f}","Sell Value":"₹{:,.2f}","P&L (₹)":"₹{:,.2f}"})
+                .map(color_pnl, subset=["P&L (₹)"]),
+                use_container_width=True, height=380
+            )
+            st.download_button("📥 Download Trade Analysis (CSV)",
+                data=show_rpt[dcols].to_csv(index=False).encode("utf-8"),
+                file_name=f"trade_pnl_{sel_stock.replace(' ','_')}.csv",
+                mime="text/csv", use_container_width=True)
+
+    # ================================================================
+    # TAB 2: ROW-PER-TRADE UPLOAD
     # ================================================================
     with tx_tab1:
-        st.markdown("**Upload your trade file** — each row has one complete trade with Purchase Date, Purchase Price, Sell Date, Sell Price all in the same row.")
-        st.caption("Your broker's P&L export file works directly here. Map columns below and click Save to remember the mapping forever.")
+        st.markdown("**Upload your broker's trade export file** — each row should have Purchase Date, Purchase Price, Sell Date, Sell Price in the same row.")
+        st.caption("Map your file's columns below. Click **Save Mapping** once — it will be remembered forever.")
 
-        rpt_file = st.file_uploader("Upload trade file (CSV or Excel)", type=['csv', 'xlsx'], key="rpt_upload")
+        rpt_file = st.file_uploader("Upload trade file (CSV or Excel)", type=['csv','xlsx'], key="rpt_upload")
 
         if rpt_file is not None:
             try:
                 rpt_df = pd.read_excel(rpt_file) if rpt_file.name.endswith('.xlsx') else pd.read_csv(rpt_file)
-                rpt_cols = [c.strip() for c in rpt_df.columns]
+                rpt_cols  = [c.strip() for c in rpt_df.columns]
                 rpt_df.columns = rpt_cols
                 rpt_lower = [c.lower() for c in rpt_cols]
-
-                # Load saved mapping for this format
                 saved_rpt = st.session_state.saved_mappings.get("rpt", {})
 
                 def _rpt_idx(key, kws, fallback=0):
                     if key in saved_rpt and saved_rpt[key] in rpt_cols:
-                        return rpt_cols.index(saved_rpt[key]) + 1  # +1 for NONE_OPT offset
-                    m = next((i for i, c in enumerate(rpt_lower) if any(kw in c for kw in kws)), -1)
-                    return m + 1 if m >= 0 else 0  # 0 = (None)
+                        return rpt_cols.index(saved_rpt[key]) + 1
+                    m = next((i for i,c in enumerate(rpt_lower) if any(kw in c for kw in kws)), -1)
+                    return m + 1 if m >= 0 else 0
 
                 NONE = "(None / Not in file)"
                 opts = [NONE] + rpt_cols
+                saved_notice = " ✅ saved mapping applied" if saved_rpt else ""
 
-                saved_notice = " ✅ (saved mapping applied — review and adjust if needed)" if saved_rpt else ""
                 st.markdown(f"#### 🗺️ Column Mapping{saved_notice}")
+                r1,r2,r3 = st.columns(3)
+                r4,r5,r6 = st.columns(3)
+                r7,r8,r9 = st.columns(3)
+                r10,_,save_col = st.columns([3,1,1])
 
-                r1, r2, r3 = st.columns(3)
-                r4, r5, r6 = st.columns(3)
-                r7, r8, r9 = st.columns(3)
-                r10, r11 = st.columns([4, 1])
-
-                with r1:
-                    m_name = st.selectbox("🏢 Company / Instrument Name *", opts, index=_rpt_idx("name", ["instrument","name","company","stock","scrip"]))
-                with r2:
-                    m_qty = st.selectbox("📦 Quantity *", opts, index=_rpt_idx("qty", ["qty","quantity","shares","units","volume"]))
-                with r3:
-                    m_isin = st.selectbox("🔖 ISIN (optional)", opts, index=_rpt_idx("isin", ["isin"]))
-
-                with r4:
-                    m_buy_date = st.selectbox("📅 Purchase Date *", opts, index=_rpt_idx("buy_date", ["purchase date","buy date","purchasedate","buydate","purchase_date"]))
-                with r5:
-                    m_buy_price = st.selectbox("💰 Purchase Price *", opts, index=_rpt_idx("buy_price", ["purchase price","buy price","purchaseprice","buyprice","purchase_price"]))
-                with r6:
-                    m_buy_value = st.selectbox("💵 Purchase Value / Cost (optional)", opts, index=_rpt_idx("buy_value", ["purchase value","purchase cost","purchasevalue","purchasecost","purchase_value","purchase_cost"]))
-
-                with r7:
-                    m_sell_date = st.selectbox("📅 Sell Date *", opts, index=_rpt_idx("sell_date", ["sell date","selldate","sell_date"]))
-                with r8:
-                    m_sell_price = st.selectbox("💸 Sell Price *", opts, index=_rpt_idx("sell_price", ["sell price","sellprice","sell_price"]))
-                with r9:
-                    m_sell_value = st.selectbox("💵 Sell Value (optional)", opts, index=_rpt_idx("sell_value", ["sell value","sellvalue","sell_value"]))
-
-                with r10:
-                    m_pnl = st.selectbox("📈 Profit/Loss column (if already calculated in your file)", opts, index=_rpt_idx("pnl", ["long term","g/l","gain","loss","pnl","profit","p&l","p / l"]))
-                with r11:
+                with r1: m_name      = st.selectbox("🏢 Company Name *", opts, index=_rpt_idx("name",["instrument","name","company","stock","scrip"]))
+                with r2: m_qty       = st.selectbox("📦 Quantity *", opts, index=_rpt_idx("qty",["qty","quantity","shares","units","volume"]))
+                with r3: m_isin      = st.selectbox("🔖 ISIN (optional)", opts, index=_rpt_idx("isin",["isin"]))
+                with r4: m_buy_date  = st.selectbox("📅 Purchase Date *", opts, index=_rpt_idx("buy_date",["purchase date","buy date","purchasedate","purchase_date"]))
+                with r5: m_buy_price = st.selectbox("💰 Purchase Price *", opts, index=_rpt_idx("buy_price",["purchase price","buy price","purchaseprice","purchase_price"]))
+                with r6: m_buy_value = st.selectbox("💵 Purchase Value (optional)", opts, index=_rpt_idx("buy_value",["purchase value","purchase cost","purchasevalue","purchase_value","purchase_cost"]))
+                with r7: m_sell_date = st.selectbox("📅 Sell Date *", opts, index=_rpt_idx("sell_date",["sell date","selldate","sell_date"]))
+                with r8: m_sell_price= st.selectbox("💸 Sell Price *", opts, index=_rpt_idx("sell_price",["sell price","sellprice","sell_price"]))
+                with r9: m_sell_value= st.selectbox("💵 Sell Value (optional)", opts, index=_rpt_idx("sell_value",["sell value","sellvalue","sell_value"]))
+                with r10: m_pnl      = st.selectbox("📈 P&L column (if pre-calculated)", opts, index=_rpt_idx("pnl",["long term","g/l","gain","loss","pnl","profit","p&l","p / l"]))
+                with save_col:
                     st.markdown("<br><br>", unsafe_allow_html=True)
                     if st.button("💾 Save Mapping", use_container_width=True, key="save_rpt_map"):
                         pm = st.session_state.saved_mappings
-                        pm["rpt"] = {
-                            "name": m_name, "qty": m_qty, "isin": m_isin,
-                            "buy_date": m_buy_date, "buy_price": m_buy_price, "buy_value": m_buy_value,
-                            "sell_date": m_sell_date, "sell_price": m_sell_price, "sell_value": m_sell_value,
-                            "pnl": m_pnl
-                        }
-                        save_mappings(pm)
-                        st.session_state.saved_mappings = pm
-                        st.toast("✅ Trade file mapping saved!", icon="💾")
-                        st.rerun()
+                        pm["rpt"] = {"name":m_name,"qty":m_qty,"isin":m_isin,"buy_date":m_buy_date,"buy_price":m_buy_price,"buy_value":m_buy_value,"sell_date":m_sell_date,"sell_price":m_sell_price,"sell_value":m_sell_value,"pnl":m_pnl}
+                        save_mappings(pm); st.session_state.saved_mappings = pm
+                        st.toast("✅ Mapping saved!", icon="💾"); st.rerun()
 
-                # Required fields check
-                required = {"Company Name": m_name, "Purchase Date": m_buy_date, "Purchase Price": m_buy_price, "Sell Date": m_sell_date, "Sell Price": m_sell_price, "Quantity": m_qty}
-                missing_req = [k for k, v in required.items() if v == NONE]
-
+                required = {"Company Name":m_name,"Purchase Date":m_buy_date,"Purchase Price":m_buy_price,"Sell Date":m_sell_date,"Sell Price":m_sell_price,"Quantity":m_qty}
+                missing_req = [k for k,v in required.items() if v == NONE]
                 if missing_req:
-                    st.warning(f"⚠️ Please map these required columns: **{', '.join(missing_req)}**")
+                    st.warning(f"⚠️ Map these required fields first: **{', '.join(missing_req)}**")
                 else:
-                    # Build standardized trade DataFrame
                     trades = pd.DataFrame()
-                    trades["share_name"] = rpt_df[m_name].astype(str).str.strip()
-                    trades["quantity"]   = pd.to_numeric(rpt_df[m_qty], errors='coerce').fillna(0)
-                    trades["buy_date"]   = pd.to_datetime(rpt_df[m_buy_date], errors='coerce')
-                    trades["buy_price"]  = pd.to_numeric(rpt_df[m_buy_price], errors='coerce').fillna(0)
-                    trades["sell_date"]  = pd.to_datetime(rpt_df[m_sell_date], errors='coerce')
-                    trades["sell_price"] = pd.to_numeric(rpt_df[m_sell_price], errors='coerce').fillna(0)
-                    trades["buy_value"]  = pd.to_numeric(rpt_df[m_buy_value], errors='coerce').fillna(0) if m_buy_value != NONE else trades["quantity"] * trades["buy_price"]
-                    trades["sell_value"] = pd.to_numeric(rpt_df[m_sell_value], errors='coerce').fillna(0) if m_sell_value != NONE else trades["quantity"] * trades["sell_price"]
-                    trades["isin"]       = rpt_df[m_isin].astype(str).str.strip() if m_isin != NONE else ""
+                    trades["share_name"]  = rpt_df[m_name].astype(str).str.strip()
+                    trades["quantity"]    = pd.to_numeric(rpt_df[m_qty], errors='coerce').fillna(0)
+                    trades["buy_date"]    = pd.to_datetime(rpt_df[m_buy_date], errors='coerce')
+                    trades["buy_price"]   = pd.to_numeric(rpt_df[m_buy_price], errors='coerce').fillna(0)
+                    trades["sell_date"]   = pd.to_datetime(rpt_df[m_sell_date], errors='coerce')
+                    trades["sell_price"]  = pd.to_numeric(rpt_df[m_sell_price], errors='coerce').fillna(0)
+                    trades["buy_value"]   = pd.to_numeric(rpt_df[m_buy_value], errors='coerce').fillna(0) if m_buy_value!=NONE else trades["quantity"]*trades["buy_price"]
+                    trades["sell_value"]  = pd.to_numeric(rpt_df[m_sell_value], errors='coerce').fillna(0) if m_sell_value!=NONE else trades["quantity"]*trades["sell_price"]
+                    trades["isin"]        = rpt_df[m_isin].astype(str).str.strip() if m_isin!=NONE else ""
+                    trades["realized_pnl"]= pd.to_numeric(rpt_df[m_pnl], errors='coerce').fillna(0) if m_pnl!=NONE else trades["sell_value"]-trades["buy_value"]
+                    trades["holding_days"]= (trades["sell_date"]-trades["buy_date"]).dt.days.fillna(0).astype(int)
+                    trades["tax_term"]    = trades["holding_days"].apply(lambda d: "LTCG (>1yr)" if d>365 else "STCG (<1yr)")
+                    trades = trades.dropna(subset=["buy_date","sell_date"])
+                    trades = trades[trades["quantity"]>0]
 
-                    if m_pnl != NONE:
-                        trades["realized_pnl"] = pd.to_numeric(rpt_df[m_pnl], errors='coerce').fillna(0)
-                    else:
-                        trades["realized_pnl"] = trades["sell_value"] - trades["buy_value"]
-
-                    trades["holding_days"] = (trades["sell_date"] - trades["buy_date"]).dt.days.fillna(0).astype(int)
-                    trades["tax_term"] = trades["holding_days"].apply(lambda d: "LTCG (>1yr)" if d > 365 else "STCG (<1yr)")
-
-                    trades = trades.dropna(subset=["buy_date", "sell_date"])
-                    trades = trades[trades["quantity"] > 0]
-
-                    st.markdown(f"#### 📋 Preview — {len(trades)} trades found")
-                    prev_show = trades.copy()
-                    prev_show["buy_date"]  = prev_show["buy_date"].dt.strftime("%Y-%m-%d")
-                    prev_show["sell_date"] = prev_show["sell_date"].dt.strftime("%Y-%m-%d")
+                    st.markdown(f"#### 📋 Preview — {len(trades)} trades")
+                    prev = trades.copy()
+                    prev["buy_date"]  = prev["buy_date"].dt.strftime("%d %b %Y")
+                    prev["sell_date"] = prev["sell_date"].dt.strftime("%d %b %Y")
                     st.dataframe(
-                        prev_show[["share_name","quantity","buy_date","buy_price","sell_date","sell_price","realized_pnl","holding_days","tax_term"]]
-                        .rename(columns={"share_name":"Company","quantity":"Qty","buy_date":"Buy Date","buy_price":"Buy Price","sell_date":"Sell Date","sell_price":"Sell Price","realized_pnl":"P&L (₹)","holding_days":"Days Held","tax_term":"Tax Term"})
-                        .style.format({"Buy Price":"₹{:,.2f}","Sell Price":"₹{:,.2f}","P&L (₹)":"₹{:,.2f}"})
+                        prev[["share_name","quantity","buy_date","buy_price","sell_date","sell_price","realized_pnl","holding_days","tax_term"]]
+                        .rename(columns={"share_name":"Company","quantity":"Qty","buy_date":"Buy Date","buy_price":"Buy ₹","sell_date":"Sell Date","sell_price":"Sell ₹","realized_pnl":"P&L (₹)","holding_days":"Days","tax_term":"Term"})
+                        .style.format({"Buy ₹":"₹{:,.2f}","Sell ₹":"₹{:,.2f}","P&L (₹)":"₹{:,.2f}"})
                         .map(color_pnl, subset=["P&L (₹)"]),
-                        use_container_width=True, height=280
+                        use_container_width=True, height=260
                     )
-
-                    if st.button("✅ Confirm & Save All Trades", use_container_width=True, key="confirm_rpt"):
+                    if st.button("✅ Confirm & Load to P&L Dashboard", use_container_width=True, key="confirm_rpt"):
                         st.session_state["rpt_trades"] = trades
-                        st.success(f"✅ {len(trades)} trades loaded! Go to 📊 P&L Dashboard tab to see your analysis.")
+                        st.success(f"✅ {len(trades)} trades loaded! Switch to 📊 P&L Dashboard tab.")
                         st.rerun()
 
             except Exception as e:
@@ -1023,207 +1160,70 @@ elif "Transaction Ledger" in menu or "💼" in menu:
 
         elif "rpt_trades" in st.session_state and not st.session_state["rpt_trades"].empty:
             n = len(st.session_state["rpt_trades"])
-            st.success(f"✅ {n} trades already loaded. Go to **📊 P&L Dashboard** tab to see analysis, or upload a new file to replace.")
+            st.success(f"✅ {n} trades already loaded. Switch to **📊 P&L Dashboard** to see analysis, or upload a new file to replace.")
 
     # ================================================================
-    # TAB 2: MANUAL ROW-PER-TRANSACTION ENTRY (classic ledger)
+    # TAB 3: MANUAL ENTRY
     # ================================================================
     with tx_tab2:
-        st.caption("Add individual BUY or SELL transactions manually. Useful for tracking current open positions alongside your sold trades.")
+        st.caption("Add individual BUY or SELL transactions manually. These are tracked separately for open-position FIFO P&L.")
         with st.form("add_transaction_form", clear_on_submit=True):
             tcol1, tcol2 = st.columns(2)
             with tcol1:
                 tx_share_name = st.text_input("Company Name", placeholder="e.g. Reliance Industries")
-                tx_ticker = st.text_input("Yahoo Ticker (optional)", placeholder="e.g. RELIANCE.NS")
-                tx_type = st.radio("Transaction Type", ["BUY", "SELL"], horizontal=True)
+                tx_ticker     = st.text_input("Yahoo Ticker (optional)", placeholder="e.g. RELIANCE.NS")
+                tx_type       = st.radio("Transaction Type", ["BUY","SELL"], horizontal=True)
             with tcol2:
-                tx_date = st.date_input("Transaction Date", value=now_ist().date())
-                tx_qty = st.number_input("Quantity", min_value=0.0, step=1.0, format="%.2f")
+                tx_date  = st.date_input("Transaction Date", value=now_ist().date())
+                tx_qty   = st.number_input("Quantity", min_value=0.0, step=1.0, format="%.2f")
                 tx_price = st.number_input("Price per share (₹)", min_value=0.0, step=0.01, format="%.2f")
-
-            tx_submitted = st.form_submit_button("💾 Add Transaction", use_container_width=True)
-            if tx_submitted:
-                if not tx_share_name or tx_qty <= 0 or tx_price <= 0:
-                    st.error("⚠️ Please fill in Company Name, Quantity, and Price.")
+            if st.form_submit_button("💾 Add Transaction", use_container_width=True):
+                if not tx_share_name or tx_qty<=0 or tx_price<=0:
+                    st.error("⚠️ Fill in Company Name, Quantity, and Price.")
                 else:
-                    new_row = pd.DataFrame([{
-                        "date": pd.to_datetime(tx_date), "share_name": tx_share_name.strip(),
-                        "ticker": tx_ticker.strip().upper(), "txn_type": tx_type,
-                        "quantity": tx_qty, "price": tx_price
-                    }])
+                    new_row = pd.DataFrame([{"date":pd.to_datetime(tx_date),"share_name":tx_share_name.strip(),"ticker":tx_ticker.strip().upper(),"txn_type":tx_type,"quantity":tx_qty,"price":tx_price}])
                     st.session_state.transactions_df = append_transactions(new_row)
-                    st.success(f"✅ Added: {tx_type} {tx_qty} × {tx_share_name} @ ₹{tx_price:,.2f}")
+                    st.success(f"✅ {tx_type} {tx_qty} × {tx_share_name} @ ₹{tx_price:,.2f}")
                     st.rerun()
 
     # ================================================================
-    # TAB 3: FULL LEDGER (manual transactions only)
+    # TAB 4: FULL LEDGER (manual transactions + FIFO P&L)
     # ================================================================
     with tx_tab3:
         tx_df = st.session_state.transactions_df
         if tx_df.empty:
-            st.info("💡 No manual transactions yet. Use 'Manual Entry' tab to add BUY/SELL rows, or use 'Upload Trade File' tab for your broker file.")
+            st.info("💡 No manual transactions yet. Use the ➕ Manual Entry tab to add BUY/SELL rows.")
         else:
             st.markdown("#### 📜 Manual Transaction Ledger")
             disp = tx_df.copy().sort_values('date', ascending=False)
-            disp['date'] = disp['date'].dt.strftime('%Y-%m-%d')
+            disp['date'] = disp['date'].dt.strftime('%d %b %Y')
             st.dataframe(disp, use_container_width=True, height=260)
-
-            dl_col, cl_col = st.columns([3, 1])
+            dl_col, cl_col = st.columns([3,1])
             with dl_col:
-                st.download_button("📥 Download Ledger (CSV)", data=tx_df.to_csv(index=False).encode('utf-8'),
-                                   file_name="transaction_ledger.csv", mime="text/csv", use_container_width=True)
+                st.download_button("📥 Download Ledger (CSV)", data=tx_df.to_csv(index=False).encode('utf-8'), file_name="transaction_ledger.csv", mime="text/csv", use_container_width=True)
             with cl_col:
                 if st.button("🗑️ Clear All", use_container_width=True):
                     st.session_state.transactions_df = pd.DataFrame(columns=TX_COLUMNS)
-                    save_transactions(st.session_state.transactions_df)
-                    st.rerun()
-
+                    save_transactions(st.session_state.transactions_df); st.rerun()
             st.markdown("---")
-            st.markdown("#### 💰 Realized P&L (FIFO method — for manual BUY/SELL entries)")
+            st.markdown("#### 💰 FIFO Realized P&L (from manual entries)")
             realized_df, open_lots_df = compute_fifo_realized_pnl(tx_df)
-
             if realized_df.empty:
-                st.info("No SELL transactions yet — P&L will appear here once you add a SELL entry.")
+                st.info("No SELL transactions yet — P&L will appear once you add a SELL.")
             else:
                 total_r = realized_df['realized_pnl'].sum()
-                stcg_r = realized_df[realized_df['tax_term'].str.contains('STCG')]['realized_pnl'].sum()
-                ltcg_r = realized_df[realized_df['tax_term'].str.contains('LTCG')]['realized_pnl'].sum()
+                stcg_r  = realized_df[realized_df['tax_term'].str.contains('STCG')]['realized_pnl'].sum()
+                ltcg_r  = realized_df[realized_df['tax_term'].str.contains('LTCG')]['realized_pnl'].sum()
+                rc1,rc2,rc3 = st.columns(3)
+                rc1.markdown(f'<div class="terminal-card"><div class="metric-title">TOTAL REALIZED P&L</div><div class="metric-value" style="color:{"#3fb950" if total_r>=0 else "#f85149"};">₹{total_r:,.2f}</div></div>', unsafe_allow_html=True)
+                rc2.markdown(f'<div class="terminal-card"><div class="metric-title">STCG P&L</div><div class="metric-value" style="color:#58a6ff;">₹{stcg_r:,.2f}</div></div>', unsafe_allow_html=True)
+                rc3.markdown(f'<div class="terminal-card"><div class="metric-title">LTCG P&L</div><div class="metric-value" style="color:#58a6ff;">₹{ltcg_r:,.2f}</div></div>', unsafe_allow_html=True)
+            if not open_lots_df.empty:
+                st.markdown("#### 📦 Open Lots (still held)")
+                ol = open_lots_df.copy()
+                ol['buy_date'] = pd.to_datetime(ol['buy_date']).dt.strftime('%d %b %Y')
+                st.dataframe(ol.rename(columns={'share_name':'Stock','buy_date':'Buy Date','quantity':'Qty','buy_price':'Buy ₹'}), use_container_width=True, height=200)
 
-                rc1, rc2, rc3 = st.columns(3)
-                with rc1:
-                    st.markdown(f'<div class="terminal-card"><div class="metric-title">TOTAL REALIZED P&L</div><div class="metric-value" style="color:{"#00ff66" if total_r>=0 else "#ff3333"};">₹ {total_r:,.2f}</div></div>', unsafe_allow_html=True)
-                with rc2:
-                    st.markdown(f'<div class="terminal-card"><div class="metric-title">STCG P&L</div><div class="metric-value" style="color:#00bfff;">₹ {stcg_r:,.2f}</div></div>', unsafe_allow_html=True)
-                with rc3:
-                    st.markdown(f'<div class="terminal-card"><div class="metric-title">LTCG P&L</div><div class="metric-value" style="color:#00bfff;">₹ {ltcg_r:,.2f}</div></div>', unsafe_allow_html=True)
-
-    # ================================================================
-    # TAB 4: P&L DASHBOARD (uses row-per-trade uploaded file)
-    # ================================================================
-    with tx_tab4:
-        rpt = st.session_state.get("rpt_trades", pd.DataFrame())
-        if rpt.empty:
-            st.info("💡 Upload your trade file in the **'📤 Upload Trade File'** tab first — then this dashboard will show your complete Profit & Loss analysis here.")
-        else:
-            total_buy  = rpt["buy_value"].sum()
-            total_sell = rpt["sell_value"].sum()
-            total_pnl  = rpt["realized_pnl"].sum()
-            total_stt  = 0
-
-            stcg_df = rpt[rpt["tax_term"] == "STCG (<1yr)"]
-            ltcg_df = rpt[rpt["tax_term"] == "LTCG (>1yr)"]
-            stcg_pnl = stcg_df["realized_pnl"].sum()
-            ltcg_pnl = ltcg_df["realized_pnl"].sum()
-            profit_trades = (rpt["realized_pnl"] > 0).sum()
-            loss_trades   = (rpt["realized_pnl"] <= 0).sum()
-            win_rate_tx   = profit_trades / len(rpt) * 100 if len(rpt) > 0 else 0
-
-            # --- KPI Row ---
-            st.markdown("#### 📈 Realized P&L Summary")
-            k1, k2, k3, k4, k5 = st.columns(5)
-            with k1:
-                pc = "#00ff66" if total_pnl >= 0 else "#ff3333"
-                st.markdown(f'<div class="terminal-card"><div class="metric-title">TOTAL REALIZED P&L</div><div class="metric-value" style="color:{pc};">₹ {total_pnl:,.2f}</div></div>', unsafe_allow_html=True)
-            with k2:
-                st.markdown(f'<div class="terminal-card"><div class="metric-title">TOTAL INVESTED (Buy)</div><div class="metric-value">₹ {total_buy:,.2f}</div></div>', unsafe_allow_html=True)
-            with k3:
-                st.markdown(f'<div class="terminal-card"><div class="metric-title">TOTAL RECEIVED (Sell)</div><div class="metric-value">₹ {total_sell:,.2f}</div></div>', unsafe_allow_html=True)
-            with k4:
-                stcg_c = "#00ff66" if stcg_pnl >= 0 else "#ff3333"
-                st.markdown(f'<div class="terminal-card"><div class="metric-title">STCG P&L (<1 yr)</div><div class="metric-value" style="color:{stcg_c};">₹ {stcg_pnl:,.2f}</div></div>', unsafe_allow_html=True)
-            with k5:
-                ltcg_c = "#00ff66" if ltcg_pnl >= 0 else "#ff3333"
-                st.markdown(f'<div class="terminal-card"><div class="metric-title">LTCG P&L (>1 yr)</div><div class="metric-value" style="color:{ltcg_c};">₹ {ltcg_pnl:,.2f}</div></div>', unsafe_allow_html=True)
-
-            # --- Tax Estimate ---
-            st.markdown("---")
-            est_stcg_tax = max(0, stcg_pnl) * 0.20
-            est_ltcg_tax = max(0, ltcg_pnl - 100000) * 0.125 if ltcg_pnl > 100000 else 0
-            total_tax = est_stcg_tax + est_ltcg_tax
-            t1, t2, t3, t4 = st.columns(4)
-            with t1:
-                st.markdown(f'<div class="terminal-card"><div class="metric-title">EST. STCG TAX (@20%)</div><div class="metric-value" style="color:#ff9900;">₹ {est_stcg_tax:,.2f}</div></div>', unsafe_allow_html=True)
-            with t2:
-                st.markdown(f'<div class="terminal-card"><div class="metric-title">EST. LTCG TAX (@12.5%)</div><div class="metric-value" style="color:#ff9900;">₹ {est_ltcg_tax:,.2f}</div></div>', unsafe_allow_html=True)
-            with t3:
-                st.markdown(f'<div class="terminal-card"><div class="metric-title">TOTAL EST. TAX</div><div class="metric-value" style="color:#ff3333;">₹ {total_tax:,.2f}</div></div>', unsafe_allow_html=True)
-            with t4:
-                st.markdown(f'<div class="terminal-card"><div class="metric-title">WIN RATE</div><div class="metric-value" style="color:#00bfff;">{win_rate_tx:.1f}%</div><div class="metric-status-blue">{profit_trades}W / {loss_trades}L</div></div>', unsafe_allow_html=True)
-            st.caption("⚠️ Tax estimate is indicative only. LTCG exempt up to ₹1 lakh per year. Consult a CA for actual tax filing.")
-
-            # --- Charts ---
-            st.markdown("---")
-            ch1, ch2 = st.columns(2)
-
-            with ch1:
-                st.markdown("#### 📊 Top Gainers vs Losers")
-                by_stock = rpt.groupby("share_name", as_index=False)["realized_pnl"].sum().sort_values("realized_pnl")
-                top10 = pd.concat([by_stock.head(5), by_stock.tail(5)]).drop_duplicates()
-                colors_gl = ["#00ff66" if v >= 0 else "#ff3333" for v in top10["realized_pnl"]]
-                fig_gl = go.Figure(go.Bar(
-                    x=top10["realized_pnl"], y=top10["share_name"], orientation='h',
-                    marker_color=colors_gl,
-                    text=top10["realized_pnl"].apply(lambda v: f"₹{v:,.0f}"),
-                    textposition="auto"
-                ))
-                fig_gl.update_layout(plot_bgcolor='#161b22', paper_bgcolor='#0d1117',
-                    font=dict(color='#8b949e'), margin=dict(l=10,r=10,t=10,b=10),
-                    xaxis=dict(gridcolor='#21262d'), yaxis=dict(gridcolor='#21262d'))
-                st.plotly_chart(fig_gl, use_container_width=True)
-
-            with ch2:
-                st.markdown("#### 🥧 STCG vs LTCG Split")
-                fig_tax = go.Figure(go.Pie(
-                    labels=["STCG Trades", "LTCG Trades"],
-                    values=[len(stcg_df), len(ltcg_df)],
-                    hole=0.5,
-                    marker=dict(colors=["#00bfff","#00ff66"])
-                ))
-                fig_tax.update_layout(paper_bgcolor='#0d1117', font=dict(color='#8b949e'),
-                    margin=dict(l=10,r=10,t=10,b=10))
-                st.plotly_chart(fig_tax, use_container_width=True)
-
-            # Monthly P&L trend
-            st.markdown("#### 📅 Monthly Realized P&L Trend")
-            rpt_m = rpt.copy()
-            rpt_m["month"] = rpt_m["sell_date"].dt.to_period("M").astype(str)
-            monthly = rpt_m.groupby("month")["realized_pnl"].sum().reset_index()
-            monthly_colors = ["#00ff66" if v >= 0 else "#ff3333" for v in monthly["realized_pnl"]]
-            fig_m = go.Figure(go.Bar(
-                x=monthly["month"], y=monthly["realized_pnl"],
-                marker_color=monthly_colors,
-                text=monthly["realized_pnl"].apply(lambda v: f"₹{v:,.0f}"),
-                textposition="auto"
-            ))
-            fig_m.update_layout(plot_bgcolor='#161b22', paper_bgcolor='#0d1117',
-                font=dict(color='#8b949e'), margin=dict(l=10,r=10,t=10,b=10),
-                xaxis=dict(gridcolor='#21262d'), yaxis=dict(gridcolor='#21262d', title="P&L (₹)"))
-            st.plotly_chart(fig_m, use_container_width=True)
-
-            # Full trade table
-            st.markdown("---")
-            st.markdown("#### 📋 All Trades Detail")
-            show_rpt = rpt.copy()
-            show_rpt["buy_date"]  = show_rpt["buy_date"].dt.strftime("%Y-%m-%d")
-            show_rpt["sell_date"] = show_rpt["sell_date"].dt.strftime("%Y-%m-%d")
-            show_rpt = show_rpt.rename(columns={
-                "share_name":"Company","quantity":"Qty",
-                "buy_date":"Purchase Date","buy_price":"Purchase Price","buy_value":"Purchase Value",
-                "sell_date":"Sell Date","sell_price":"Sell Price","sell_value":"Sell Value",
-                "realized_pnl":"P&L (₹)","holding_days":"Days Held","tax_term":"Tax Term"
-            })
-            display_cols = ["Company","Qty","Purchase Date","Purchase Price","Purchase Value","Sell Date","Sell Price","Sell Value","P&L (₹)","Days Held","Tax Term"]
-            display_cols = [c for c in display_cols if c in show_rpt.columns]
-            st.dataframe(
-                show_rpt[display_cols].style
-                .format({"Purchase Price":"₹{:,.2f}","Purchase Value":"₹{:,.2f}","Sell Price":"₹{:,.2f}","Sell Value":"₹{:,.2f}","P&L (₹)":"₹{:,.2f}"})
-                .map(color_pnl, subset=["P&L (₹)"]),
-                use_container_width=True, height=350
-            )
-
-            st.download_button("📥 Download Trade Analysis (CSV)",
-                data=show_rpt[display_cols].to_csv(index=False).encode("utf-8"),
-                file_name="trade_pnl_analysis.csv", mime="text/csv", use_container_width=True)
 
 elif not df.empty:
     # Strip whitespace from column names
