@@ -781,55 +781,77 @@ def fetch_search_suggestions(query: str):
 
 if "Search Any Stock" in menu or "🔎" in menu:
     st.markdown("<h3>🔎 Search Any Stock</h3>", unsafe_allow_html=True)
-    st.caption("Type a few letters of the company name or ticker — suggestions will appear automatically. Click one to load its live price and 52-week data.")
+    st.caption("Type 2+ letters — suggestions appear automatically. **Select from dropdown** or press Enter to load live price & 52-week data.")
 
-    # ── Autocomplete: text input + live dropdown ──
+    # Session state init for search
     if "search_selected_ticker" not in st.session_state:
         st.session_state.search_selected_ticker = ""
-    if "search_selected_name" not in st.session_state:
-        st.session_state.search_selected_name = ""
+    if "search_last_query" not in st.session_state:
+        st.session_state.search_last_query = ""
 
+    # Step 1: Type to search
     search_query = st.text_input(
-        "🔍 Type company name or ticker (e.g. Reliance, TCS, Apple, INFY):",
-        value=st.session_state.get("search_box_text", ""),
-        placeholder="e.g. Reliance, Infosys, Tata Motors, AAPL…",
+        "🔍 Type company name or ticker:",
+        placeholder="e.g. Reliance, Dabur, TCS, Apple, INFY…",
         key="search_box_input"
     )
-    st.session_state["search_box_text"] = search_query
 
-    # Fetch and show suggestions while typing (min 2 chars, no confirmed selection yet)
     confirmed_ticker = st.session_state.search_selected_ticker
 
-    if search_query and len(search_query) >= 2 and not confirmed_ticker:
-        with st.spinner("Searching..."):
-            suggestions = fetch_search_suggestions(search_query)
+    # If user cleared the box, reset confirmed ticker too
+    if not search_query and confirmed_ticker:
+        st.session_state.search_selected_ticker = ""
+        confirmed_ticker = ""
+
+    # Step 2: Show dropdown selectbox once 2+ chars typed
+    if search_query and len(search_query.strip()) >= 2:
+        suggestions = fetch_search_suggestions(search_query.strip())
 
         if suggestions:
-            st.caption(f"**{len(suggestions)} suggestion(s) found** — click one to select:")
-            for s in suggestions:
-                if st.button(s["label"], key=f"sugg_{s['ticker']}", use_container_width=True):
-                    st.session_state.search_selected_ticker = s["ticker"]
-                    st.session_state.search_selected_name = s["name"]
-                    st.session_state["search_box_text"] = s["name"]
-                    st.rerun()
-        else:
-            st.info("No suggestions found — try a different spelling or type the exact Yahoo ticker (e.g. RELIANCE.NS).")
+            options = [s["label"] for s in suggestions]
+            tickers = [s["ticker"] for s in suggestions]
+            names   = [s["name"]   for s in suggestions]
 
-    elif confirmed_ticker:
-        # Clear selection button
-        cl1, cl2 = st.columns([4,1])
-        with cl2:
-            if st.button("✖ Clear", use_container_width=True):
+            # Find if previously selected option is still in list
+            prev_label = next(
+                (s["label"] for s in suggestions if s["ticker"] == confirmed_ticker),
+                None
+            )
+            default_idx = options.index(prev_label) if prev_label else 0
+
+            chosen_label = st.selectbox(
+                f"📋 {len(suggestions)} match(es) found — select one (or press Enter for top result):",
+                options=options,
+                index=default_idx,
+                key=f"search_dropdown_{search_query[:20]}"
+            )
+
+            chosen_idx = options.index(chosen_label)
+            auto_ticker = tickers[chosen_idx]
+            auto_name   = names[chosen_idx]
+
+            # Auto-load: whenever selection changes OR Enter pressed (query submitted)
+            if auto_ticker != confirmed_ticker:
+                st.session_state.search_selected_ticker = auto_ticker
+                confirmed_ticker = auto_ticker
+
+        else:
+            st.info("No suggestions found — try a different spelling or use exact Yahoo ticker (e.g. RELIANCE.NS).")
+            confirmed_ticker = ""
+
+    # Step 3: Show stock data for confirmed ticker
+    if confirmed_ticker:
+        col_hdr, col_clr = st.columns([5, 1])
+        with col_clr:
+            if st.button("✖ New Search", use_container_width=True):
                 st.session_state.search_selected_ticker = ""
-                st.session_state.search_selected_name = ""
-                st.session_state["search_box_text"] = ""
                 st.rerun()
 
-        with st.spinner(f"Loading data for {confirmed_ticker}..."):
+        with st.spinner(f"Loading live data for **{confirmed_ticker}**..."):
             result = search_any_stock(confirmed_ticker)
 
         if result is None:
-            st.error(f"⚠️ Could not fetch data for {confirmed_ticker}. Try again.")
+            st.error(f"⚠️ Could not fetch data for {confirmed_ticker}. Try another.")
         else:
             st.markdown(f"#### {result['company_name']}  `{result['ticker']}`")
             sc1, sc2, sc3 = st.columns(3)
@@ -857,8 +879,8 @@ if "Search Any Stock" in menu or "🔎" in menu:
                     yaxis=dict(gridcolor='#21262d', color='#8b949e')
                 )
                 st.plotly_chart(fig_search, use_container_width=True)
-    else:
-        st.info("💡 Start typing above — company suggestions will appear automatically as you type.")
+    elif not search_query:
+        st.info("💡 Start typing above — company suggestions will appear automatically.")
 
 # ==================== TRANSACTION LEDGER TAB ====================
 elif "Transaction Ledger" in menu or "💼" in menu:
