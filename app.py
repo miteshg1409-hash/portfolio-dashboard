@@ -314,7 +314,7 @@ def fetch_live_prices_from_yahoo(tickers_list):
             continue
         try:
             stock = yf.Ticker(ticker)
-            hist = stock.history(period="1d")
+            hist = stock.history(period="2d")
             if not hist.empty:
                 prices_dict[ticker] = hist['Close'].iloc[-1]
             else:
@@ -322,6 +322,54 @@ def fetch_live_prices_from_yahoo(tickers_list):
         except Exception:
             prices_dict[ticker] = 0
     return prices_dict
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_day_change(tickers_list):
+    """Returns {ticker: (day_change_pct, prev_close, volume)} for each ticker."""
+    change_dict = {}
+    for ticker in tickers_list:
+        if not ticker:
+            continue
+        try:
+            stock = yf.Ticker(ticker)
+            hist = stock.history(period="2d")
+            if len(hist) >= 2:
+                prev  = hist['Close'].iloc[-2]
+                curr  = hist['Close'].iloc[-1]
+                vol   = hist['Volume'].iloc[-1]
+                chg   = ((curr - prev) / prev * 100) if prev > 0 else 0
+                change_dict[ticker] = (round(chg, 2), round(prev, 2), int(vol))
+            else:
+                change_dict[ticker] = (0.0, 0.0, 0)
+        except Exception:
+            change_dict[ticker] = (0.0, 0.0, 0)
+    return change_dict
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_market_indices():
+    """Fetch Nifty 50, Sensex, and Bank Nifty live values for the market overview bar."""
+    indices = {
+        "NIFTY 50": "^NSEI",
+        "SENSEX":   "^BSESN",
+        "BANK NIFTY": "^NSEBANK",
+        "NIFTY IT": "^CNXIT",
+    }
+    result = {}
+    for name, sym in indices.items():
+        try:
+            hist = yf.Ticker(sym).history(period="2d")
+            if len(hist) >= 2:
+                curr = hist['Close'].iloc[-1]
+                prev = hist['Close'].iloc[-2]
+                chg  = (curr - prev) / prev * 100
+                result[name] = (round(curr, 2), round(chg, 2))
+            elif len(hist) == 1:
+                result[name] = (round(hist['Close'].iloc[-1], 2), 0.0)
+        except Exception:
+            pass
+    return result
 
 
 # Caching function for 52-week high/low (fetched straight from Yahoo Finance's 1-year history)
@@ -1410,11 +1458,32 @@ elif not df.empty:
 
         if not high_risk_stocks.empty:
             for idx, row in high_risk_stocks.iterrows():
-                st.markdown(f'<div class="risk-warning">⚠️ **Concentration Risk Alert:** **{row["Weight"]:.1f}%** of your total capital is invested in **{row["share_name"]}** alone.</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="risk-warning">⚠️ <b>Concentration Risk:</b> <b>{row["Weight"]:.1f}%</b> of total capital is in <b>{row["share_name"]}</b> alone.</div>', unsafe_allow_html=True)
 
-        st.markdown("<h4 style='color: #76808c; margin-bottom: 10px;'>📈 Terminal Performance Matrix</h4>", unsafe_allow_html=True)
+        # ── Portfolio Health Score ──────────────────────────────────────────
+        def calc_health_score(df_h):
+            score = 0
+            # 1. Diversification (max 25 pts): 10+ stocks = 25, 5-9 = 15, <5 = 5
+            n = len(df_h['share_name'].unique())
+            score += 25 if n >= 10 else (15 if n >= 5 else 5)
+            # 2. Win rate (max 25 pts)
+            wr = (df_h['PnL'] > 0).sum() / max(len(df_h),1) * 100
+            score += min(25, int(wr / 4))
+            # 3. Concentration (max 25 pts): no stock > 15% = 25, > 25% = 0
+            max_w = df_h['Weight'].max()
+            score += 25 if max_w < 15 else (15 if max_w < 25 else 0)
+            # 4. Overall return (max 25 pts)
+            ret = (df_h['PnL'].sum() / df_h['Invested'].sum() * 100) if df_h['Invested'].sum() > 0 else 0
+            score += 25 if ret >= 15 else (18 if ret >= 5 else (10 if ret >= 0 else 0))
+            return min(100, score)
 
-        # XIRR calculation: prefer actual transaction history if available, else approximate using buy_price/date-less holdings
+        health = calc_health_score(df)
+        health_color = "#3fb950" if health >= 70 else ("#e3b341" if health >= 45 else "#f85149")
+        health_label = "Excellent 💪" if health >= 70 else ("Moderate ⚠️" if health >= 45 else "Needs Attention 🔴")
+
+        st.markdown("<h4 style='color:#e6edf3; margin-bottom:10px;'>📈 Terminal Performance Matrix</h4>", unsafe_allow_html=True)
+
+        # XIRR calculation
         xirr_value = None
         tx_df_for_xirr = st.session_state.get("transactions_df", pd.DataFrame())
         if not tx_df_for_xirr.empty:
@@ -1428,107 +1497,173 @@ elif not df.empty:
             except Exception:
                 xirr_value = None
 
-        kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
-        with kpi1:
-            st.markdown(f'<div class="terminal-card"><div class="metric-title">TOTAL CAPITAL INVESTED</div><div class="metric-value">₹ {total_invested:,.2f}</div><div class="metric-status-blue">● Net Asset Base</div></div>', unsafe_allow_html=True)
-        with kpi2:
-            st.markdown(f'<div class="terminal-card"><div class="metric-title">CURRENT VALUE (YAHOO)</div><div class="metric-value">₹ {total_current:,.2f}</div><div class="metric-status-blue">Yahoo Real-time Synced</div></div>', unsafe_allow_html=True)
-        with kpi3:
-            pnl_color_class = "metric-status-green" if total_pnl >= 0 else "metric-status-red"
-            pnl_sign = "+" if total_pnl >= 0 else ""
-            st.markdown(f'<div class="terminal-card"><div class="metric-title">WEIGHTED RETURNS</div><div class="metric-value" style="color: {"#00ff66" if total_pnl >= 0 else "#ff3333"}">{pnl_sign}{weighted_return:.2f}%</div><div class="{pnl_color_class}">PnL: ₹ {total_pnl:,.2f}</div></div>', unsafe_allow_html=True)
-        with kpi4:
-            st.markdown(f'<div class="terminal-card"><div class="metric-title">PORTFOLIO WIN RATE</div><div class="metric-value" style="color: #00bfff;">{win_rate:.1f}%</div><div class="metric-status-blue">{profit_stocks} Gainer / {total_stocks - profit_stocks} Loser</div></div>', unsafe_allow_html=True)
-        with kpi5:
-            if xirr_value is not None:
-                xirr_color = "#00ff66" if xirr_value >= 0 else "#ff3333"
-                st.markdown(f'<div class="terminal-card"><div class="metric-title">XIRR (ANNUALIZED)</div><div class="metric-value" style="color:{xirr_color};">{xirr_value:.2f}%</div><div class="metric-status-blue">Based on Transaction Ledger</div></div>', unsafe_allow_html=True)
-            else:
-                st.markdown(f'<div class="terminal-card"><div class="metric-title">XIRR (ANNUALIZED)</div><div class="metric-value" style="color:#76808c; font-size:14px;">No data</div><div class="metric-status-blue">Add transactions in 💼 Ledger tab</div></div>', unsafe_allow_html=True)
+        kpi1, kpi2, kpi3, kpi4, kpi5, kpi6 = st.columns(6)
+        kpi1.markdown(f'<div class="terminal-card"><div class="metric-title">TOTAL INVESTED</div><div class="metric-value">₹{total_invested:,.0f}</div><div class="metric-status-blue">● Net Asset Base</div></div>', unsafe_allow_html=True)
+        kpi2.markdown(f'<div class="terminal-card"><div class="metric-title">CURRENT VALUE</div><div class="metric-value">₹{total_current:,.0f}</div><div class="metric-status-blue">Yahoo Live</div></div>', unsafe_allow_html=True)
+        pnl_c = "#3fb950" if total_pnl >= 0 else "#f85149"
+        kpi3.markdown(f'<div class="terminal-card"><div class="metric-title">UNREALIZED P&L</div><div class="metric-value" style="color:{pnl_c};">{"+" if total_pnl>=0 else ""}₹{total_pnl:,.0f}</div><div class="metric-status-blue">{weighted_return:+.2f}%</div></div>', unsafe_allow_html=True)
+        kpi4.markdown(f'<div class="terminal-card"><div class="metric-title">WIN RATE</div><div class="metric-value" style="color:#58a6ff;">{win_rate:.1f}%</div><div class="metric-status-blue">{profit_stocks}G / {total_stocks-profit_stocks}L</div></div>', unsafe_allow_html=True)
+        if xirr_value is not None:
+            xc = "#3fb950" if xirr_value >= 0 else "#f85149"
+            kpi5.markdown(f'<div class="terminal-card"><div class="metric-title">XIRR</div><div class="metric-value" style="color:{xc};">{xirr_value:.2f}%</div><div class="metric-status-blue">Annualized</div></div>', unsafe_allow_html=True)
+        else:
+            kpi5.markdown(f'<div class="terminal-card"><div class="metric-title">XIRR</div><div class="metric-value" style="color:#8b949e;font-size:13px;">Add trades<br>in Ledger</div></div>', unsafe_allow_html=True)
+        kpi6.markdown(f'<div class="terminal-card"><div class="metric-title">HEALTH SCORE</div><div class="metric-value" style="color:{health_color};">{health}/100</div><div class="metric-status-blue">{health_label}</div></div>', unsafe_allow_html=True)
 
         if not df_filtered.empty:
+            # ── Row 1: Bar chart + Pie ────────────────────────────────────
             col_left, col_right = st.columns([3, 2])
             with col_left:
-                st.markdown("<h4>📊 Stock Performance Chart (Net PnL Impact)</h4>", unsafe_allow_html=True)
-                colors = ['#00ff66' if val >= 0 else '#ff3333' for val in df_filtered['PnL']]
-                fig_bar = go.Figure(data=[go.Bar(x=df_filtered['share_name'], y=df_filtered['PnL'], marker_color=colors, text=df_filtered['PnL'].apply(lambda x: f"₹{x:,.0f}"), textposition='auto')])
-                fig_bar.update_layout(plot_bgcolor='#161b22', paper_bgcolor='#0d1117', font=dict(color='#8b949e'), margin=dict(l=10, r=10, t=10, b=10), xaxis=dict(showgrid=False), yaxis=dict(gridcolor='#21262d'))
+                st.markdown("<h4>📊 Stock P&L Impact</h4>", unsafe_allow_html=True)
+                df_bar = df_filtered.groupby('share_name', as_index=False).agg({'PnL':'sum','Invested':'sum'})
+                df_bar = df_bar.sort_values('PnL')
+                fig_bar = go.Figure(go.Bar(
+                    x=df_bar['share_name'], y=df_bar['PnL'],
+                    marker_color=['#3fb950' if v>=0 else '#f85149' for v in df_bar['PnL']],
+                    text=df_bar['PnL'].apply(lambda x: f"₹{x:,.0f}"), textposition='auto'
+                ))
+                fig_bar.update_layout(plot_bgcolor='#161b22', paper_bgcolor='#0d1117', font=dict(color='#8b949e'), margin=dict(l=10,r=10,t=10,b=10), xaxis=dict(showgrid=False, tickangle=-45), yaxis=dict(gridcolor='#21262d'))
                 st.plotly_chart(fig_bar, use_container_width=True)
 
             with col_right:
-                st.markdown("<h4>📦 Asset Allocation Weightage (Weight %)</h4>", unsafe_allow_html=True)
-                fig_pie = go.Figure(data=[go.Pie(labels=df_filtered['share_name'], values=df_filtered['Invested'], hole=.6, hoverinfo="label+percent+value", textinfo="none")])
-                fig_pie.update_layout(plot_bgcolor='#161b22', paper_bgcolor='#0d1117', font=dict(color='#8b949e'), margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h", y=-0.1))
+                st.markdown("<h4>📦 Asset Allocation</h4>", unsafe_allow_html=True)
+                df_pie = df_filtered.groupby('share_name', as_index=False)['Invested'].sum()
+                fig_pie = go.Figure(go.Pie(labels=df_pie['share_name'], values=df_pie['Invested'], hole=.55, hoverinfo="label+percent+value", textinfo="none"))
+                fig_pie.update_layout(plot_bgcolor='#161b22', paper_bgcolor='#0d1117', font=dict(color='#8b949e'), margin=dict(l=10,r=10,t=10,b=10), legend=dict(orientation="h", y=-0.15))
                 st.plotly_chart(fig_pie, use_container_width=True)
 
-            # ---- Sector Allocation + Portfolio History Trend ----
+            # ── Row 2: 52W Position Meter ─────────────────────────────────
+            st.markdown("---")
+            st.markdown("#### 📏 52-Week Price Position Meter")
+            st.caption("Shows where each stock's current price sits within its 52-week Low → High range. Left = near low, Right = near high.")
+
+            df_52 = df_filtered[df_filtered['high_52w'] > 0].copy()
+            df_52 = df_52.groupby('share_name').agg({'live_price':'last','high_52w':'last','low_52w':'last','PnL':'sum'}).reset_index()
+            df_52 = df_52[df_52['high_52w'] > df_52['low_52w']].copy()
+            df_52['position_pct'] = ((df_52['live_price'] - df_52['low_52w']) / (df_52['high_52w'] - df_52['low_52w']) * 100).clip(0, 100)
+
+            if not df_52.empty:
+                for _, row52 in df_52.sort_values('position_pct').head(20).iterrows():
+                    pos = row52['position_pct']
+                    bar_color = "#f85149" if pos < 30 else ("#e3b341" if pos < 60 else "#3fb950")
+                    pnl_txt = f"₹{row52['PnL']:+,.0f}"
+                    name_short = row52['share_name'][:28] + "…" if len(row52['share_name']) > 30 else row52['share_name']
+                    st.markdown(f"""
+                    <div style='margin-bottom:6px;'>
+                      <div style='display:flex; justify-content:space-between; font-size:12px; color:#8b949e; margin-bottom:2px;'>
+                        <span><b style='color:#e6edf3;'>{name_short}</b> &nbsp; ₹{row52['live_price']:,.2f}</span>
+                        <span>52W: ₹{row52['low_52w']:,.0f} — ₹{row52['high_52w']:,.0f} &nbsp; <b style='color:{"#3fb950" if row52["PnL"]>=0 else "#f85149"};'>{pnl_txt}</b></span>
+                      </div>
+                      <div style='background:#21262d; border-radius:4px; height:10px; position:relative;'>
+                        <div style='width:{pos:.1f}%; background:{bar_color}; border-radius:4px; height:10px;'></div>
+                        <div style='position:absolute; left:{pos:.1f}%; top:-2px; width:3px; height:14px; background:#fff; border-radius:2px;'></div>
+                      </div>
+                    </div>""", unsafe_allow_html=True)
+            else:
+                st.info("52-week range data not available yet — it loads in the background.")
+
+            # ── Row 3: Sector + History ──────────────────────────────────
+            st.markdown("---")
             col_sec, col_hist = st.columns([2, 3])
             with col_sec:
-                st.markdown("<h4>🏭 Sector-wise Allocation</h4>", unsafe_allow_html=True)
+                st.markdown("<h4>🏭 Sector Allocation</h4>", unsafe_allow_html=True)
                 with st.spinner("Fetching sector data..."):
                     sector_map = fetch_sector_info(tuple(resolved_unique_tickers))
                 df_sector = df_filtered.copy()
                 df_sector['Sector'] = df_sector['resolved_ticker'].map(sector_map).fillna('Unknown')
-                sector_grouped = df_sector.groupby('Sector', as_index=False)['Invested'].sum().sort_values('Invested', ascending=False)
-                fig_sector = go.Figure(data=[go.Pie(labels=sector_grouped['Sector'], values=sector_grouped['Invested'], hole=.5, hoverinfo="label+percent+value", textinfo="percent")])
-                fig_sector.update_layout(plot_bgcolor='#161b22', paper_bgcolor='#0d1117', font=dict(color='#8b949e'), margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h", y=-0.2))
-                st.plotly_chart(fig_sector, use_container_width=True)
+                sec_grp = df_sector.groupby('Sector', as_index=False)['Invested'].sum().sort_values('Invested', ascending=False)
+                fig_sec = go.Figure(go.Pie(labels=sec_grp['Sector'], values=sec_grp['Invested'], hole=.5, hoverinfo="label+percent+value", textinfo="percent"))
+                fig_sec.update_layout(plot_bgcolor='#161b22', paper_bgcolor='#0d1117', font=dict(color='#8b949e'), margin=dict(l=10,r=10,t=10,b=10), legend=dict(orientation="h", y=-0.2))
+                st.plotly_chart(fig_sec, use_container_width=True)
 
             with col_hist:
-                st.markdown("<h4>📈 Portfolio Value Trend (Over Time)</h4>", unsafe_allow_html=True)
+                st.markdown("<h4>📈 Portfolio Value Trend</h4>", unsafe_allow_html=True)
                 hist_data = load_history()
                 if len(hist_data) < 2:
-                    st.info("📊 Trend chart will build up as you use the app over multiple days. Each day's snapshot is saved automatically — come back tomorrow to see the trend grow!")
+                    st.info("📊 Trend chart builds up day by day. Come back tomorrow to see it grow!")
                 else:
                     fig_hist = go.Figure()
-                    fig_hist.add_trace(go.Scatter(x=hist_data['date'], y=hist_data['total_current'], name='Current Value', line=dict(color='#00bfff')))
-                    fig_hist.add_trace(go.Scatter(x=hist_data['date'], y=hist_data['total_invested'], name='Invested', line=dict(color='#76808c', dash='dot')))
-                    fig_hist.update_layout(plot_bgcolor='#161b22', paper_bgcolor='#0d1117', font=dict(color='#8b949e'), margin=dict(l=10, r=10, t=10, b=10), xaxis=dict(gridcolor='#21262d'), yaxis=dict(gridcolor='#21262d', title='₹'), legend=dict(orientation="h", y=-0.2))
+                    fig_hist.add_trace(go.Scatter(x=hist_data['date'], y=hist_data['total_current'], name='Current Value', line=dict(color='#58a6ff'), fill='tozeroy', fillcolor='rgba(88,166,255,0.06)'))
+                    fig_hist.add_trace(go.Scatter(x=hist_data['date'], y=hist_data['total_invested'], name='Invested', line=dict(color='#8b949e', dash='dot')))
+                    fig_hist.update_layout(plot_bgcolor='#161b22', paper_bgcolor='#0d1117', font=dict(color='#8b949e'), margin=dict(l=10,r=10,t=10,b=10), xaxis=dict(gridcolor='#21262d'), yaxis=dict(gridcolor='#21262d', title='₹'), legend=dict(orientation="h", y=-0.2))
                     st.plotly_chart(fig_hist, use_container_width=True)
 
-            st.markdown("<h4>📋 Live Positions (Yahoo Synced Price)</h4>", unsafe_allow_html=True)
-            display_df = df_filtered[['share_name', 'resolved_ticker', 'quantity', 'buy_price', 'Simulated_Live', 'high_52w', 'low_52w', 'Invested', 'Current', 'PnL', 'Returns_Pct', 'Action']].copy()
-            display_df.columns = ['Stock Name', 'Yahoo Ticker', 'Quantity', 'Buy Price', 'Live Price (Sim)', '52W High', '52W Low', 'Total Invested', 'Current Value', 'PnL (₹)', 'Returns (%)', 'Terminal Signal/Action']
+            # ── Row 4: Live Positions Table ───────────────────────────────
+            st.markdown("---")
+            st.markdown("<h4>📋 Live Positions</h4>", unsafe_allow_html=True)
 
-            st.dataframe(display_df.style.format({
-                'Buy Price': '₹{:,.2f}', 'Live Price (Sim)': '₹{:,.2f}',
-                '52W High': '₹{:,.2f}', '52W Low': '₹{:,.2f}',
-                'Total Invested': '₹{:,.2f}', 'Current Value': '₹{:,.2f}',
-                'PnL (₹)': '₹{:,.2f}', 'Returns (%)': '{:.2f}%'
-            }).map(color_pnl, subset=['PnL (₹)', 'Returns (%)']), use_container_width=True, height=350)
+            # Add % from 52W Low/High columns
+            df_disp = df_filtered.copy()
+            df_disp['From 52W Low'] = ((df_disp['Simulated_Live'] - df_disp['low_52w']) / df_disp['low_52w'].replace(0,1) * 100)
+            df_disp['From 52W High'] = ((df_disp['Simulated_Live'] - df_disp['high_52w']) / df_disp['high_52w'].replace(0,1) * 100)
 
-            # ---- Advanced Tools ----
+            display_df = df_disp[['share_name','resolved_ticker','quantity','buy_price','Simulated_Live','high_52w','low_52w','From 52W Low','From 52W High','Invested','Current','PnL','Returns_Pct','Action']].copy()
+            display_df.columns = ['Stock','Yahoo Ticker','Qty','Buy ₹','Live ₹','52W High','52W Low','↑ from Low%','↓ from High%','Invested','Current','P&L (₹)','Return%','Signal']
+
+            st.dataframe(
+                display_df.style.format({
+                    'Buy ₹':'₹{:,.2f}','Live ₹':'₹{:,.2f}',
+                    '52W High':'₹{:,.2f}','52W Low':'₹{:,.2f}',
+                    '↑ from Low%':'{:+.1f}%','↓ from High%':'{:+.1f}%',
+                    'Invested':'₹{:,.0f}','Current':'₹{:,.0f}',
+                    'P&L (₹)':'₹{:,.2f}','Return%':'{:+.2f}%'
+                }).map(color_pnl, subset=['P&L (₹)','Return%']),
+                use_container_width=True, height=380
+            )
+
+            # ── Row 5: Top 5 Holdings risk table ─────────────────────────
+            st.markdown("---")
+            t5col1, t5col2 = st.columns([1, 1])
+            with t5col1:
+                st.markdown("#### 🏆 Top 5 Holdings by Weight")
+                top5 = df_filtered.groupby('share_name', as_index=False).agg({'Invested':'sum','Current':'sum','PnL':'sum','Weight':'sum'}).nlargest(5,'Weight')
+                top5['Return%'] = (top5['PnL'] / top5['Invested'] * 100)
+                st.dataframe(
+                    top5[['share_name','Weight','Invested','Current','PnL','Return%']]
+                    .rename(columns={'share_name':'Stock','Weight':'Weight%','Invested':'Invested ₹','Current':'Current ₹','PnL':'P&L ₹'})
+                    .style.format({'Weight%':'{:.1f}%','Invested ₹':'₹{:,.0f}','Current ₹':'₹{:,.0f}','P&L ₹':'₹{:,.0f}','Return%':'{:+.1f}%'})
+                    .map(color_pnl, subset=['P&L ₹','Return%']),
+                    use_container_width=True, height=220
+                )
+
+            with t5col2:
+                st.markdown("#### 📉 Drawdown from Buy Price")
+                df_dd = df_filtered.copy()
+                df_dd['Drawdown%'] = ((df_dd['Simulated_Live'] - df_dd['buy_price']) / df_dd['buy_price'].replace(0,1) * 100)
+                df_dd_grp = df_dd.groupby('share_name', as_index=False).agg({'Drawdown%':'mean'}).sort_values('Drawdown%').head(10)
+                fig_dd = go.Figure(go.Bar(
+                    x=df_dd_grp['Drawdown%'], y=df_dd_grp['share_name'], orientation='h',
+                    marker_color=['#f85149' if v < 0 else '#3fb950' for v in df_dd_grp['Drawdown%']],
+                    text=df_dd_grp['Drawdown%'].apply(lambda v: f"{v:+.1f}%"), textposition='auto'
+                ))
+                fig_dd.update_layout(plot_bgcolor='#161b22', paper_bgcolor='#0d1117', font=dict(color='#8b949e'), margin=dict(l=10,r=10,t=10,b=10), xaxis=dict(gridcolor='#21262d',title='% Change'), yaxis=dict(gridcolor='#21262d'))
+                st.plotly_chart(fig_dd, use_container_width=True)
+
+            # ── Row 6: Tools ──────────────────────────────────────────────
             st.markdown("---")
             st.markdown("### 🛠️ Advanced Terminal Tools")
-            tool_col1, tool_col2 = st.columns([1, 1])
-
+            tool_col1, tool_col2 = st.columns(2)
             with tool_col1:
-                st.markdown("<h4>💸 Tax Liability Estimator (Tentative Tax)</h4>", unsafe_allow_html=True)
-                hold_duration = st.radio("Select holding duration:", ["Less than 1 year (STCG)", "More than 1 year (LTCG)"], horizontal=True)
+                st.markdown("<h4>💸 Tax Liability Estimator</h4>", unsafe_allow_html=True)
+                hold_duration = st.radio("Holding duration:", ["Less than 1 year (STCG)", "More than 1 year (LTCG)"], horizontal=True)
                 if total_pnl > 0:
                     if "STCG" in hold_duration:
                         estimated_tax = total_pnl * 0.20
-                        st.warning(f"💼 Estimated Short-Term Tax (STCG @20%): ₹ {estimated_tax:,.2f}")
+                        st.warning(f"💼 STCG Tax @20%: ₹{estimated_tax:,.2f}")
                     else:
                         taxable_pnl = max(0, total_pnl - 100000)
                         estimated_tax = taxable_pnl * 0.125
-                        st.success(f"💼 Estimated Long-Term Tax (LTCG @12.5%): ₹ {estimated_tax:,.2f} (after ₹1 lakh exemption)")
+                        st.success(f"💼 LTCG Tax @12.5% (after ₹1L exemption): ₹{estimated_tax:,.2f}")
                 else:
-                    st.info("📉 Portfolio is currently in loss, so no tax is applicable.")
-
+                    st.info("📉 Portfolio in loss — no tax applicable.")
             with tool_col2:
-                st.markdown("<h4>📥 Terminal Report Export</h4>", unsafe_allow_html=True)
-                st.write("Save the current Yahoo Finance data and system signals as an Excel (CSV) file.")
-                csv_data = display_df.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="📥 Download Exported Report (CSV)",
-                    data=csv_data,
-                    file_name="AlphaPortfolio_Yahoo_Report.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
+                st.markdown("<h4>📥 Export Report</h4>", unsafe_allow_html=True)
+                st.write("Download the full live positions table as CSV.")
+                st.download_button("📥 Download Portfolio Report (CSV)",
+                    data=display_df.to_csv(index=False).encode('utf-8'),
+                    file_name="AlphaPortfolio_Report.csv", mime="text/csv", use_container_width=True)
         else:
-            st.warning("No data available to display for the selected filter.")
+            st.warning("No data to display for selected filter.")
 
     # ==================== MENU 2: ADVANCED ANALYSIS ====================
     elif "Advanced Analysis" in menu or "📈" in menu:
@@ -1594,45 +1729,79 @@ elif not df.empty:
     # ==================== MENU 3: SINGLE STOCK DEEP-DIVE ====================
     elif "Single Stock" in menu or "🔍" in menu:
         st.markdown("<h3>🔍 Single Stock Deep-Dive Analysis</h3>", unsafe_allow_html=True)
-        selected_stock = st.selectbox("Select a stock to analyze:", df['share_name'].unique())
+        selected_stock = st.selectbox("Select a stock to analyze:", sorted(df['share_name'].unique()))
 
-        stock_data = df[df['share_name'] == selected_stock].iloc[0]
+        stock_rows = df[df['share_name'] == selected_stock]
+        stock_data = stock_rows.iloc[0]
+        total_qty   = stock_rows['quantity'].sum()
+        total_inv   = stock_rows['Invested'].sum()
+        avg_buy     = total_inv / total_qty if total_qty > 0 else 0
+        total_cur   = stock_rows['Current'].sum()
+        total_pnl_s = stock_rows['PnL'].sum()
+        ret_pct_s   = (total_pnl_s / total_inv * 100) if total_inv > 0 else 0
 
-        sc1, sc2, sc3, sc4, sc5, sc6 = st.columns(6)
-        with sc1:
-            st.markdown(f'<div class="terminal-card"><div class="metric-title">Buy Price</div><div class="metric-value">₹ {stock_data["buy_price"]:,.2f}</div></div>', unsafe_allow_html=True)
-        with sc2:
-            st.markdown(f'<div class="terminal-card"><div class="metric-title">Yahoo Live Price</div><div class="metric-value">₹ {stock_data["Simulated_Live"]:,.2f}</div></div>', unsafe_allow_html=True)
-        with sc3:
-            s_color = "#00ff66" if stock_data["PnL"] >= 0 else "#ff3333"
-            st.markdown(f'<div class="terminal-card"><div class="metric-title">Net PnL</div><div class="metric-value" style="color: {s_color}">₹ {stock_data["PnL"]:,.2f}</div></div>', unsafe_allow_html=True)
-        with sc4:
-            st.markdown(f'<div class="terminal-card"><div class="metric-title">Portfolio Weight</div><div class="metric-value" style="color: #00bfff;">{stock_data["Weight"]:.2f}%</div></div>', unsafe_allow_html=True)
-        with sc5:
-            st.markdown(f'<div class="terminal-card"><div class="metric-title">52-Week High</div><div class="metric-value" style="color: #00ff66;">₹ {stock_data["high_52w"]:,.2f}</div></div>', unsafe_allow_html=True)
-        with sc6:
-            st.markdown(f'<div class="terminal-card"><div class="metric-title">52-Week Low</div><div class="metric-value" style="color: #ff3333;">₹ {stock_data["low_52w"]:,.2f}</div></div>', unsafe_allow_html=True)
+        sc1,sc2,sc3,sc4,sc5,sc6 = st.columns(6)
+        sc1.markdown(f'<div class="terminal-card"><div class="metric-title">AVG BUY PRICE</div><div class="metric-value">₹{avg_buy:,.2f}</div></div>', unsafe_allow_html=True)
+        sc2.markdown(f'<div class="terminal-card"><div class="metric-title">LIVE PRICE</div><div class="metric-value">₹{stock_data["Simulated_Live"]:,.2f}</div></div>', unsafe_allow_html=True)
+        sc3.markdown(f'<div class="terminal-card"><div class="metric-title">NET P&L</div><div class="metric-value" style="color:{"#3fb950" if total_pnl_s>=0 else "#f85149"};">₹{total_pnl_s:,.0f}</div></div>', unsafe_allow_html=True)
+        sc4.markdown(f'<div class="terminal-card"><div class="metric-title">RETURN</div><div class="metric-value" style="color:{"#3fb950" if ret_pct_s>=0 else "#f85149"};">{ret_pct_s:+.2f}%</div></div>', unsafe_allow_html=True)
+        sc5.markdown(f'<div class="terminal-card"><div class="metric-title">52W HIGH</div><div class="metric-value" style="color:#3fb950;">₹{stock_data["high_52w"]:,.2f}</div></div>', unsafe_allow_html=True)
+        sc6.markdown(f'<div class="terminal-card"><div class="metric-title">52W LOW</div><div class="metric-value" style="color:#f85149;">₹{stock_data["low_52w"]:,.2f}</div></div>', unsafe_allow_html=True)
 
+        # Live 1-year chart from Yahoo + buy price line
+        resolved_tk = stock_data.get('resolved_ticker','')
+        if resolved_tk:
+            with st.spinner(f"Loading 1-year chart for {resolved_tk}..."):
+                try:
+                    hist_1y = yf.Ticker(resolved_tk).history(period="1y")
+                except Exception:
+                    hist_1y = pd.DataFrame()
+            if not hist_1y.empty:
+                fig_ss = go.Figure()
+                fig_ss.add_trace(go.Scatter(
+                    x=hist_1y.index, y=hist_1y['Close'],
+                    name='Price', line=dict(color='#58a6ff', width=2),
+                    fill='tozeroy', fillcolor='rgba(88,166,255,0.06)'
+                ))
+                fig_ss.add_hline(y=avg_buy, line_dash="dash", line_color="#e3b341",
+                    annotation_text=f"Avg Buy ₹{avg_buy:,.2f}", annotation_position="top left",
+                    annotation=dict(font=dict(color="#e3b341")))
+                if stock_data['high_52w'] > 0:
+                    fig_ss.add_hline(y=stock_data['high_52w'], line_dash="dot", line_color="#3fb950",
+                        annotation_text=f"52W High ₹{stock_data['high_52w']:,.2f}", annotation_position="top right",
+                        annotation=dict(font=dict(color="#3fb950")))
+                    fig_ss.add_hline(y=stock_data['low_52w'], line_dash="dot", line_color="#f85149",
+                        annotation_text=f"52W Low ₹{stock_data['low_52w']:,.2f}", annotation_position="bottom right",
+                        annotation=dict(font=dict(color="#f85149")))
+                fig_ss.update_layout(
+                    plot_bgcolor='#161b22', paper_bgcolor='#0d1117',
+                    font=dict(color='#8b949e'), margin=dict(l=10,r=10,t=40,b=10),
+                    title=dict(text=f"{selected_stock} — 1-Year Price Chart", font=dict(color='#e6edf3',size=14)),
+                    xaxis=dict(gridcolor='#21262d', color='#8b949e'),
+                    yaxis=dict(gridcolor='#21262d', color='#8b949e', title='₹'),
+                    showlegend=False
+                )
+                st.plotly_chart(fig_ss, use_container_width=True)
+
+        # Gauge
         fig_gauge = go.Figure(go.Indicator(
-            mode = "gauge+number",
-            value = stock_data['Returns_Pct'],
-            domain = {'x': [0, 1], 'y': [0, 1]},
-            title = {'text': f"{selected_stock} Overall Returns (%)", 'font': {'color': "#ffffff"}},
-            gauge = {
-                'axis': {'range': [-50, 100], 'tickcolor': "#76808c"},
-                'bar': {'color': "#00bfff"},
-                'steps': [
-                    {'range': [-50, 0], 'color': "rgba(255, 51, 51, 0.2)"},
-                    {'range': [0, 100], 'color': "rgba(0, 255, 102, 0.2)"}
+            mode="gauge+number+delta",
+            value=ret_pct_s,
+            delta={'reference': 0, 'valueformat': '.2f', 'suffix': '%'},
+            domain={'x':[0,1],'y':[0,1]},
+            title={'text': f"Overall Return — {selected_stock}", 'font':{'color':'#e6edf3'}},
+            number={'suffix':'%','font':{'color':'#58a6ff'}},
+            gauge={
+                'axis':{'range':[-50,100],'tickcolor':'#8b949e'},
+                'bar':{'color':'#58a6ff'},
+                'steps':[
+                    {'range':[-50,0],'color':'rgba(248,81,73,0.15)'},
+                    {'range':[0,100],'color':'rgba(63,185,80,0.12)'}
                 ],
-                'threshold': {
-                    'line': {'color': "red", 'width': 4},
-                    'thickness': 0.75,
-                    'value': target_pct
-                }
+                'threshold':{'line':{'color':'#e3b341','width':3},'thickness':0.75,'value':target_pct}
             }
         ))
-        fig_gauge.update_layout(paper_bgcolor='#0d1117', font=dict(color='#8b949e'), margin=dict(l=20, r=20, t=40, b=20))
+        fig_gauge.update_layout(paper_bgcolor='#0d1117', font=dict(color='#8b949e'), margin=dict(l=20,r=20,t=50,b=20))
         st.plotly_chart(fig_gauge, use_container_width=True)
 else:
     st.info("💡 Terminal is ready! Please upload your file (CSV or Excel), or use the '🔎 Search Any Stock' tab in the sidebar to look up any stock without uploading a file.")
