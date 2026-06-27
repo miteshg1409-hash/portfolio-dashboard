@@ -282,28 +282,100 @@ def fetch_market_indices():
 # ★ NEW: NEWS FEED via Yahoo Finance RSS
 # ══════════════════════════════════════════════════════════════════════
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_stock_news(tickers_list, max_per_ticker=3):
+def fetch_stock_news(tickers_list, max_per_ticker=4):
+    """Fetch news using Google News RSS (best Indian stock coverage) + ET Markets RSS.
+    Returns articles from the last 2 weeks only, sorted newest first."""
+    from email.utils import parsedate_to_datetime
+    import time
+
+    two_weeks_ago = datetime.now(timezone.utc) - timedelta(days=14)
     all_news = []
-    seen = set()
-    for ticker in list(tickers_list)[:15]:  # limit to avoid timeout
-        if not ticker: continue
+    seen_titles = set()
+
+    # 1. Google News RSS per ticker (best for Indian stocks)
+    for ticker in list(tickers_list)[:20]:
+        if not ticker:
+            continue
+        # Strip exchange suffix for more natural search
+        clean_name = ticker.replace(".NS", "").replace(".BO", "").replace(".BSE", "")
+        search_terms = [
+            f"https://news.google.com/rss/search?q={clean_name}+stock+NSE&hl=en-IN&gl=IN&ceid=IN:en",
+            f"https://news.google.com/rss/search?q={clean_name}+shares&hl=en-IN&gl=IN&ceid=IN:en",
+        ]
+        for url in search_terms:
+            try:
+                feed = feedparser.parse(url)
+                for entry in feed.entries[:max_per_ticker]:
+                    title = entry.get("title", "").strip()
+                    if not title or title in seen_titles:
+                        continue
+                    # Parse date and filter last 2 weeks
+                    pub_str = entry.get("published", "")
+                    try:
+                        pub_dt = parsedate_to_datetime(pub_str) if pub_str else None
+                        if pub_dt and pub_dt < two_weeks_ago:
+                            continue  # skip older than 2 weeks
+                        pub_display = pub_dt.strftime("%d %b %Y, %H:%M") if pub_dt else pub_str[:16]
+                    except Exception:
+                        pub_display = pub_str[:16]
+                        pub_dt = None
+
+                    seen_titles.add(title)
+                    all_news.append({
+                        "ticker": ticker,
+                        "title": title,
+                        "link": entry.get("link", "#"),
+                        "published": pub_display,
+                        "pub_dt": pub_dt,
+                        "source": entry.get("source", {}).get("title", "Google News") if hasattr(entry.get("source", ""), "get") else "Google News",
+                        "summary": entry.get("summary", "")[:200] if entry.get("summary") else "",
+                    })
+            except Exception:
+                pass
+
+    # 2. Indian Finance RSS Feeds (broad market coverage)
+    indian_feeds = [
+        ("Economic Times Markets", "https://economictimes.indiatimes.com/markets/stocks/rss.cms"),
+        ("ET Corporate News",       "https://economictimes.indiatimes.com/news/company/corporate-trends/rssfeeds/2143429.cms"),
+        ("Business Standard",       "https://www.business-standard.com/rss/markets-106.rss"),
+        ("Moneycontrol News",       "https://www.moneycontrol.com/rss/latestnews.xml"),
+        ("LiveMint Markets",        "https://www.livemint.com/rss/markets"),
+    ]
+    for source_name, url in indian_feeds:
         try:
-            url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=IN&lang=en-US"
             feed = feedparser.parse(url)
-            for entry in feed.entries[:max_per_ticker]:
-                title = entry.get("title","")
-                if title in seen: continue
-                seen.add(title)
+            for entry in feed.entries[:5]:
+                title = entry.get("title", "").strip()
+                if not title or title in seen_titles:
+                    continue
+                pub_str = entry.get("published", "")
+                try:
+                    pub_dt = parsedate_to_datetime(pub_str) if pub_str else None
+                    if pub_dt and pub_dt < two_weeks_ago:
+                        continue
+                    pub_display = pub_dt.strftime("%d %b %Y, %H:%M") if pub_dt else pub_str[:16]
+                except Exception:
+                    pub_display = pub_str[:16]
+                    pub_dt = None
+                seen_titles.add(title)
                 all_news.append({
-                    "ticker": ticker,
+                    "ticker": "📰 Market",
                     "title": title,
-                    "link": entry.get("link","#"),
-                    "published": entry.get("published",""),
-                    "summary": entry.get("summary","")[:200] if entry.get("summary") else "",
+                    "link": entry.get("link", "#"),
+                    "published": pub_display,
+                    "pub_dt": pub_dt,
+                    "source": source_name,
+                    "summary": entry.get("summary", "")[:200] if entry.get("summary") else "",
                 })
         except Exception:
             pass
-    return all_news[:40]
+
+    # Sort by date newest first, put None dates at end
+    all_news.sort(
+        key=lambda x: x["pub_dt"] if x["pub_dt"] else datetime(2000, 1, 1, tzinfo=timezone.utc),
+        reverse=True
+    )
+    return all_news[:60]
 
 # ══════════════════════════════════════════════════════════════════════
 # ★ NEW: BENCHMARK COMPARISON (Portfolio vs Nifty 50)
@@ -761,22 +833,27 @@ elif "News Feed" in menu or "📰" in menu:
 
     if news_tickers:
         st.caption(f"Loading news for {len(news_tickers)} stock(s)...")
-        with st.spinner("Fetching latest news from Yahoo Finance..."):
+        with st.spinner("Fetching latest news (Google News + Economic Times)..."):
             news_items = fetch_stock_news(tuple(news_tickers[:20]))
 
         if news_items:
-            st.markdown(f"**{len(news_items)} articles** across {len(set(n['ticker'] for n in news_items))} stock(s).")
+            st.caption(f"📅 Showing last **14 days** of news only | Source: Google News + Economic Times")
+            st.markdown(f"**{len(news_items)} articles** across {len(set(n['ticker'] for n in news_items))} source(s).")
             filter_ticker = st.selectbox("Filter by stock:", ["All"] + sorted(set(n['ticker'] for n in news_items)))
             filtered = [n for n in news_items if filter_ticker == "All" or n['ticker'] == filter_ticker]
             for n in filtered:
                 st.markdown(f"""<div class="news-card">
                     <a href="{n['link']}" target="_blank" style="text-decoration:none;">
                     <div class="news-title">{n['title']}</div></a>
-                    <div class="news-meta">📌 {n['ticker']} &nbsp;|&nbsp; {n.get('published','')}</div>
+                    <div class="news-meta">
+                        📌 <b>{n['ticker']}</b> &nbsp;|&nbsp;
+                        🗞️ {n.get('source','News')} &nbsp;|&nbsp;
+                        🕐 {n.get('published','')}
+                    </div>
                     {f'<div style="color:#8b949e;font-size:12px;margin-top:6px;">{n["summary"]}…</div>' if n.get('summary') else ''}
                 </div>""", unsafe_allow_html=True)
         else:
-            st.info("⚠️ No news found for your portfolio stocks via Yahoo Finance RSS. Yahoo's news feed has limited coverage for many Indian NSE/BSE stocks. Try searching a specific ticker (e.g. RELIANCE.NS, TCS.NS) or a US stock like AAPL to test the feed.")
+            st.warning("⚠️ No news found in the last 2 weeks for your portfolio stocks. Try searching a specific company name in the box above (e.g. 'Reliance Industries' or 'Infosys').")
     else:
         if df.empty:
             st.info("💡 Upload your portfolio file above, or type a ticker/company name to search for news.")
