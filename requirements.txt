@@ -5,3 +5,4 @@ yfinance
 streamlit-autorefresh
 requests
 openpyxl
+feedparser
