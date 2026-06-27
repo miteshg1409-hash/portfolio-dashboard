@@ -2,7 +2,7 @@ streamlit
 pandas
 plotly
 yfinance
-feedparser
-requests
 streamlit-autorefresh
-google-generativeai
+requests
+openpyxl
+feedparser
