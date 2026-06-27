@@ -724,20 +724,46 @@ if "Settings" in menu or "⚙️" in menu:
 elif "News Feed" in menu or "📰" in menu:
     st.markdown("<h3>📰 Market News Feed</h3>", unsafe_allow_html=True)
 
-    # Allow news search for any ticker, or load from portfolio if file uploaded
     news_query = st.text_input("Search news for any ticker or company:", placeholder="e.g. RELIANCE.NS, TCS, Infosys")
     news_tickers = []
+
     if news_query.strip():
+        # Manual search
         tk = news_query.strip().upper() if _looks_like_ticker(news_query.strip()) else _search_yahoo_symbol(news_query.strip())
-        if tk: news_tickers = [tk]
-    elif not df.empty and 'resolved_ticker' in df.columns:
-        news_tickers = [t for t in df['resolved_ticker'].dropna().unique() if t]
+        if tk:
+            news_tickers = [tk]
+
     elif not df.empty:
-        st.info("📋 Upload and process your portfolio file on Overview Dashboard first — news will auto-load for all your holdings.")
+        # Auto-load from uploaded file — resolve tickers on the fly if not already done
+        if 'resolved_ticker' in df.columns:
+            # Already resolved (user visited Overview tab first)
+            news_tickers = [t for t in df['resolved_ticker'].dropna().unique() if t]
+        else:
+            # File uploaded but not yet processed — resolve tickers now
+            df_news = df.copy()
+            df_news.columns = df_news.columns.str.strip()
+            news_cols = list(df_news.columns)
+
+            # Pick the ticker/company column using saved mapping or first column
+            saved_pm_news = st.session_state.saved_mappings.get("portfolio", {})
+            ticker_col_news = saved_pm_news.get("ticker", news_cols[0]) if saved_pm_news.get("ticker") in news_cols else news_cols[0]
+
+            st.caption(f"📋 Auto-loading news for holdings from column: **{ticker_col_news}** — uses saved mapping or first column. Go to Overview Dashboard to change column mapping.")
+
+            raw_names = [str(v).strip() for v in df_news[ticker_col_news].dropna().unique() if str(v).strip()]
+            raw_names = [v for v in raw_names if v and not any(x in v.upper() for x in ['TOTAL','GRAND'])][:60]
+
+            if raw_names:
+                manual_ov = tuple(sorted(st.session_state.manual_ticker_overrides.items()))
+                with st.spinner(f"🔎 Resolving {len(raw_names)} company names to Yahoo tickers for news..."):
+                    resolution = resolve_tickers(tuple(raw_names), manual_ov)
+                news_tickers = sorted({t for t in resolution.values() if t})
 
     if news_tickers:
-        with st.spinner("Fetching latest news..."):
+        st.caption(f"Loading news for {len(news_tickers)} stock(s)...")
+        with st.spinner("Fetching latest news from Yahoo Finance..."):
             news_items = fetch_stock_news(tuple(news_tickers[:20]))
+
         if news_items:
             st.markdown(f"**{len(news_items)} articles** across {len(set(n['ticker'] for n in news_items))} stock(s).")
             filter_ticker = st.selectbox("Filter by stock:", ["All"] + sorted(set(n['ticker'] for n in news_items)))
@@ -750,9 +776,10 @@ elif "News Feed" in menu or "📰" in menu:
                     {f'<div style="color:#8b949e;font-size:12px;margin-top:6px;">{n["summary"]}…</div>' if n.get('summary') else ''}
                 </div>""", unsafe_allow_html=True)
         else:
-            st.info("No news found. News may be limited for some Indian stocks via this feed — try a US stock like AAPL for testing.")
+            st.info("⚠️ No news found for your portfolio stocks via Yahoo Finance RSS. Yahoo's news feed has limited coverage for many Indian NSE/BSE stocks. Try searching a specific ticker (e.g. RELIANCE.NS, TCS.NS) or a US stock like AAPL to test the feed.")
     else:
-        st.info("💡 Type a ticker/company name above, or upload your portfolio file to auto-load news for all your holdings.")
+        if df.empty:
+            st.info("💡 Upload your portfolio file above, or type a ticker/company name to search for news.")
 
 # ══════════════════════════════════════════════════════════════════════
 # SEARCH ANY STOCK
