@@ -1,1485 +1,1763 @@
 import streamlit as st
 import pandas as pd
-import re
-import os
-import json
-import smtplib
-import ssl
-import feedparser
-import requests as _requests
-from email.mime.text import MIMEText
+import numpy as np
+import re, os, json, smtplib, ssl, feedparser
+import requests as _req
 from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from datetime import datetime, timezone, timedelta
 import plotly.graph_objects as go
 import plotly.express as px
 import yfinance as yf
 from streamlit_autorefresh import st_autorefresh
 
-# ── IST timezone ──────────────────────────────────────────────────────
+# ── IST ──────────────────────────────────────────────────────────────
 IST = timezone(timedelta(hours=5, minutes=30))
-def now_ist():
-    return datetime.now(IST)
+def now_ist(): return datetime.now(IST)
 
-# ── Persistent file paths ─────────────────────────────────────────────
-_BASE = os.path.dirname(os.path.abspath(__file__))
-OVERRIDES_FILE   = os.path.join(_BASE, "ticker_overrides.json")
-MAPPING_FILE     = os.path.join(_BASE, "column_mappings.json")
-TRANSACTIONS_FILE= os.path.join(_BASE, "transactions.csv")
-HISTORY_FILE     = os.path.join(_BASE, "portfolio_history.csv")
-ALERTS_FILE      = os.path.join(_BASE, "price_alerts.json")
-SETTINGS_FILE    = os.path.join(_BASE, "app_settings.json")
+# ── File paths ────────────────────────────────────────────────────────
+_B = os.path.dirname(os.path.abspath(__file__))
+def _fp(n): return os.path.join(_B, n)
+OVERRIDES_F  = _fp("ticker_overrides.json")
+MAPPING_F    = _fp("column_mappings.json")
+TX_F         = _fp("transactions.csv")
+HISTORY_F    = _fp("portfolio_history.csv")
+ALERTS_F     = _fp("price_alerts.json")
+SETTINGS_F   = _fp("app_settings.json")
+MF_F         = _fp("mf_watchlist.json")
+TX_COLS      = ["date","share_name","ticker","txn_type","quantity","price"]
+HIST_COLS    = ["date","total_invested","total_current","total_pnl"]
 
-TX_COLUMNS       = ["date","share_name","ticker","txn_type","quantity","price"]
-HISTORY_COLUMNS  = ["date","total_invested","total_current","total_pnl"]
-
-# ── Generic load/save helpers ─────────────────────────────────────────
-def _load_json(path, default):
+def _jload(p, d):
     try:
-        if os.path.exists(path):
-            with open(path,"r",encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return default
+        if os.path.exists(p):
+            with open(p,"r",encoding="utf-8") as f: return json.load(f)
+    except: pass
+    return d
 
-def _save_json(path, data):
+def _jsave(p, d):
     try:
-        with open(path,"w",encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        with open(p,"w",encoding="utf-8") as f: json.dump(d,f,ensure_ascii=False,indent=2)
         return True
-    except Exception:
-        return False
+    except: return False
 
-def load_overrides():    return _load_json(OVERRIDES_FILE, {})
-def save_overrides(d):   return _save_json(OVERRIDES_FILE, d)
-def load_mappings():     return _load_json(MAPPING_FILE, {})
-def save_mappings(d):    return _save_json(MAPPING_FILE, d)
-def load_price_alerts(): return _load_json(ALERTS_FILE, {})
-def save_price_alerts(d):return _save_json(ALERTS_FILE, d)
-def load_settings():     return _load_json(SETTINGS_FILE, {})
-def save_settings(d):    return _save_json(SETTINGS_FILE, d)
+load_overrides  = lambda: _jload(OVERRIDES_F, {})
+save_overrides  = lambda d: _jsave(OVERRIDES_F, d)
+load_mappings   = lambda: _jload(MAPPING_F, {})
+save_mappings   = lambda d: _jsave(MAPPING_F, d)
+load_price_alerts = lambda: _jload(ALERTS_F, {})
+save_price_alerts = lambda d: _jsave(ALERTS_F, d)
+load_settings   = lambda: _jload(SETTINGS_F, {})
+save_settings   = lambda d: _jsave(SETTINGS_F, d)
+load_mf_list    = lambda: _jload(MF_F, [])
+save_mf_list    = lambda d: _jsave(MF_F, d)
 
-# ── Transaction helpers ───────────────────────────────────────────────
 def load_transactions():
     try:
-        if os.path.exists(TRANSACTIONS_FILE):
-            df_tx = pd.read_csv(TRANSACTIONS_FILE)
-            df_tx['date'] = pd.to_datetime(df_tx['date'], errors='coerce')
-            return df_tx
-    except Exception:
-        pass
-    return pd.DataFrame(columns=TX_COLUMNS)
+        if os.path.exists(TX_F):
+            df = pd.read_csv(TX_F)
+            df['date'] = pd.to_datetime(df['date'], errors='coerce')
+            return df
+    except: pass
+    return pd.DataFrame(columns=TX_COLS)
 
-def save_transactions(df_tx):
+def save_transactions(df):
     try:
-        out = df_tx.copy()
+        out = df.copy()
         out['date'] = pd.to_datetime(out['date']).dt.strftime('%Y-%m-%d')
-        out.to_csv(TRANSACTIONS_FILE, index=False)
-        return True
-    except Exception:
-        return False
+        out.to_csv(TX_F, index=False); return True
+    except: return False
 
-def append_transactions(new_rows):
-    combined = pd.concat([load_transactions(), new_rows], ignore_index=True)
-    save_transactions(combined)
-    return combined
+def append_transactions(rows):
+    combined = pd.concat([load_transactions(), rows], ignore_index=True)
+    save_transactions(combined); return combined
 
-def append_history_snapshot(total_invested, total_current, total_pnl):
+def append_history_snap(ti, tc, tp):
     try:
         today = now_ist().strftime('%Y-%m-%d')
-        hist = pd.read_csv(HISTORY_FILE) if os.path.exists(HISTORY_FILE) else pd.DataFrame(columns=HISTORY_COLUMNS)
-        hist = hist[hist['date'] != today]
-        hist = pd.concat([hist, pd.DataFrame([{"date":today,"total_invested":total_invested,"total_current":total_current,"total_pnl":total_pnl}])], ignore_index=True)
-        hist.to_csv(HISTORY_FILE, index=False)
-    except Exception:
-        pass
+        h = pd.read_csv(HISTORY_F) if os.path.exists(HISTORY_F) else pd.DataFrame(columns=HIST_COLS)
+        h = h[h['date'] != today]
+        h = pd.concat([h, pd.DataFrame([{"date":today,"total_invested":ti,"total_current":tc,"total_pnl":tp}])], ignore_index=True)
+        h.to_csv(HISTORY_F, index=False)
+    except: pass
 
 def load_history():
     try:
-        if os.path.exists(HISTORY_FILE):
-            h = pd.read_csv(HISTORY_FILE)
+        if os.path.exists(HISTORY_F):
+            h = pd.read_csv(HISTORY_F)
             h['date'] = pd.to_datetime(h['date'])
             return h.sort_values('date')
-    except Exception:
-        pass
-    return pd.DataFrame(columns=HISTORY_COLUMNS)
+    except: pass
+    return pd.DataFrame(columns=HIST_COLS)
 
 # ══════════════════════════════════════════════════════════════════════
 # PAGE CONFIG + THEME
 # ══════════════════════════════════════════════════════════════════════
-st.set_page_config(page_title="AlphaPortfolio Terminal Pro+", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="AlphaPortfolio Pro+ v6", layout="wide", initial_sidebar_state="expanded")
 
 st.markdown("""<style>
-.stApp{background-color:#0d1117;color:#cdd9e5;}
-[data-testid="stSidebar"]{background:linear-gradient(180deg,#161b22 0%,#0d1117 100%);border-right:1px solid #30363d;}
+.stApp{background:#0d1117;color:#cdd9e5;}
+[data-testid="stSidebar"]{background:linear-gradient(180deg,#161b22,#0d1117);border-right:1px solid #30363d;}
 [data-testid="stSidebar"] *{color:#cdd9e5!important;}
-.stTabs [data-baseweb="tab-list"]{background-color:#161b22;border-radius:8px 8px 0 0;padding:4px 6px 0;gap:4px;border-bottom:2px solid #30363d;}
-.stTabs [data-baseweb="tab"]{background-color:#21262d;color:#8b949e!important;border-radius:6px 6px 0 0;padding:8px 16px;font-weight:600;font-size:13px;border:1px solid #30363d;border-bottom:none;transition:all .2s;}
-.stTabs [aria-selected="true"]{background-color:#1f6feb!important;color:#fff!important;border-color:#1f6feb!important;}
-.stTabs [data-baseweb="tab"]:hover{background-color:#30363d!important;color:#e6edf3!important;}
-.stTabs [data-baseweb="tab-panel"]{background-color:#161b22;border:1px solid #30363d;border-top:none;border-radius:0 0 8px 8px;padding:18px;}
-.terminal-card{background:linear-gradient(135deg,#161b22 0%,#1c2128 100%);padding:18px 20px;border-radius:10px;border:1px solid #30363d;box-shadow:0 2px 12px rgba(0,0,0,.4);margin-bottom:14px;transition:border-color .2s;}
-.terminal-card:hover{border-color:#1f6feb;}
-.metric-title{font-size:11px;color:#8b949e;font-weight:700;text-transform:uppercase;letter-spacing:1.2px;}
-.metric-value{font-size:22px;color:#e6edf3;font-weight:700;margin-top:6px;font-family:'Courier New',monospace;}
-.metric-status-green{color:#3fb950;font-size:12px;font-weight:600;margin-top:4px;}
-.metric-status-red{color:#f85149;font-size:12px;font-weight:600;margin-top:4px;}
-.metric-status-blue{color:#58a6ff;font-size:12px;font-weight:600;margin-top:4px;}
-.risk-warning{background-color:rgba(248,81,73,.12);border:1px solid #f85149;padding:12px 16px;border-radius:8px;color:#ffa198;margin-bottom:14px;font-size:13px;line-height:1.6;}
-.alert-box-high{background-color:rgba(63,185,80,.12);border:1px solid #3fb950;padding:10px 14px;border-radius:8px;color:#56d364;margin-bottom:10px;font-size:13px;}
-.alert-box-low{background-color:rgba(248,81,73,.12);border:1px solid #f85149;padding:10px 14px;border-radius:8px;color:#ffa198;margin-bottom:10px;font-size:13px;}
-.map-box{background-color:#1c2128;padding:14px 18px;border-radius:8px;border:1px dashed #58a6ff;margin-bottom:18px;color:#cdd9e5;}
-.market-bar{background:#161b22;border-bottom:1px solid #30363d;padding:10px 16px;display:flex;gap:24px;align-items:center;flex-wrap:wrap;font-size:13px;}
-.market-item{display:flex;flex-direction:column;align-items:flex-start;}
-.market-name{font-size:10px;color:#8b949e;font-weight:700;text-transform:uppercase;letter-spacing:.8px;}
-.market-val{font-family:'Courier New',monospace;font-weight:700;color:#e6edf3;}
-.market-chg-pos{color:#3fb950;font-size:11px;font-weight:600;}
-.market-chg-neg{color:#f85149;font-size:11px;font-weight:600;}
-.news-card{background:#1c2128;border:1px solid #30363d;border-radius:8px;padding:12px 14px;margin-bottom:8px;transition:border-color .2s;}
-.news-card:hover{border-color:#58a6ff;}
-.news-title{color:#e6edf3;font-weight:600;font-size:13px;line-height:1.4;}
-.news-meta{color:#8b949e;font-size:11px;margin-top:4px;}
-.scorecard-row{display:flex;gap:12px;margin-bottom:10px;flex-wrap:wrap;}
-.scorecard-item{flex:1;min-width:140px;background:#1c2128;border:1px solid #30363d;border-radius:8px;padding:10px 14px;}
-.scorecard-label{font-size:10px;color:#8b949e;font-weight:700;text-transform:uppercase;letter-spacing:.8px;}
-.scorecard-val{font-size:18px;font-weight:700;font-family:'Courier New',monospace;margin-top:4px;}
-.stTextInput>div>div>input,.stSelectbox>div>div>div{background-color:#21262d!important;color:#e6edf3!important;border:1px solid #30363d!important;border-radius:6px!important;}
+.stTabs [data-baseweb="tab-list"]{background:#161b22;border-radius:8px 8px 0 0;padding:4px 6px 0;gap:4px;border-bottom:2px solid #30363d;}
+.stTabs [data-baseweb="tab"]{background:#21262d;color:#8b949e!important;border-radius:6px 6px 0 0;padding:8px 14px;font-weight:600;font-size:12px;border:1px solid #30363d;border-bottom:none;}
+.stTabs [aria-selected="true"]{background:#1f6feb!important;color:#fff!important;border-color:#1f6feb!important;}
+.stTabs [data-baseweb="tab-panel"]{background:#161b22;border:1px solid #30363d;border-top:none;border-radius:0 0 8px 8px;padding:16px;}
+.tc{background:linear-gradient(135deg,#161b22,#1c2128);padding:16px 18px;border-radius:10px;border:1px solid #30363d;box-shadow:0 2px 12px rgba(0,0,0,.4);margin-bottom:12px;transition:border-color .2s;}
+.tc:hover{border-color:#1f6feb;}
+.mt{font-size:10px;color:#8b949e;font-weight:700;text-transform:uppercase;letter-spacing:1.2px;}
+.mv{font-size:20px;color:#e6edf3;font-weight:700;margin-top:5px;font-family:'Courier New',monospace;}
+.mg{color:#3fb950;font-size:11px;font-weight:600;margin-top:3px;}
+.mr{color:#f85149;font-size:11px;font-weight:600;margin-top:3px;}
+.mb{color:#58a6ff;font-size:11px;font-weight:600;margin-top:3px;}
+.rw{background:rgba(248,81,73,.12);border:1px solid #f85149;padding:10px 14px;border-radius:8px;color:#ffa198;margin-bottom:12px;font-size:13px;line-height:1.5;}
+.ah{background:rgba(63,185,80,.12);border:1px solid #3fb950;padding:8px 12px;border-radius:8px;color:#56d364;margin-bottom:8px;font-size:13px;}
+.al{background:rgba(248,81,73,.12);border:1px solid #f85149;padding:8px 12px;border-radius:8px;color:#ffa198;margin-bottom:8px;font-size:13px;}
+.mb-box{background:#1c2128;padding:12px 16px;border-radius:8px;border:1px dashed #58a6ff;margin-bottom:16px;color:#cdd9e5;}
+.mbar{background:#161b22;border-bottom:1px solid #30363d;padding:8px 16px;display:flex;gap:20px;align-items:center;flex-wrap:wrap;font-size:13px;}
+.mi{display:flex;flex-direction:column;}
+.mn{font-size:9px;color:#8b949e;font-weight:700;text-transform:uppercase;letter-spacing:.8px;}
+.mv2{font-family:'Courier New',monospace;font-weight:700;color:#e6edf3;font-size:14px;}
+.mcg{color:#3fb950;font-size:10px;font-weight:600;}
+.mcr{color:#f85149;font-size:10px;font-weight:600;}
+.nc{background:#1c2128;border:1px solid #30363d;border-radius:8px;padding:10px 12px;margin-bottom:7px;transition:border-color .2s;}
+.nc:hover{border-color:#58a6ff;}
+.nt{color:#e6edf3;font-weight:600;font-size:13px;line-height:1.4;}
+.nm{color:#8b949e;font-size:11px;margin-top:3px;}
+.ai-msg{background:#1c2128;border-left:3px solid #58a6ff;padding:12px 16px;border-radius:0 8px 8px 0;margin-bottom:10px;font-size:13px;line-height:1.6;color:#cdd9e5;}
+.ai-user{background:#161b22;border-left:3px solid #3fb950;padding:10px 14px;border-radius:0 8px 8px 0;margin-bottom:8px;font-size:13px;color:#cdd9e5;}
+.stTextInput>div>div>input,.stSelectbox>div>div>div{background:#21262d!important;color:#e6edf3!important;border:1px solid #30363d!important;border-radius:6px!important;}
 .stDataFrame{border:1px solid #30363d!important;border-radius:8px;}
-.stButton>button{background-color:#21262d;color:#cdd9e5;border:1px solid #30363d;border-radius:6px;font-weight:600;transition:all .2s;}
-.stButton>button:hover{background-color:#1f6feb;color:#fff;border-color:#1f6feb;}
-::-webkit-scrollbar{width:6px;height:6px;}
+.stButton>button{background:#21262d;color:#cdd9e5;border:1px solid #30363d;border-radius:6px;font-weight:600;transition:all .2s;}
+.stButton>button:hover{background:#1f6feb;color:#fff;border-color:#1f6feb;}
+::-webkit-scrollbar{width:5px;height:5px;}
 ::-webkit-scrollbar-track{background:#0d1117;}
 ::-webkit-scrollbar-thumb{background:#30363d;border-radius:3px;}
 ::-webkit-scrollbar-thumb:hover{background:#58a6ff;}
 h1,h2,h3,h4{color:#e6edf3!important;}
 </style>""", unsafe_allow_html=True)
 
-# ══════════════════════════════════════════════════════════════════════
-# AUTO-REFRESH every 1 second
-# ══════════════════════════════════════════════════════════════════════
-st_autorefresh(interval=1000, key="live_price_autorefresh")
+st_autorefresh(interval=1000, key="ar1")
 
 # ══════════════════════════════════════════════════════════════════════
 # TICKER RESOLVER
 # ══════════════════════════════════════════════════════════════════════
-_TICKER_PATTERN = re.compile(r'^[A-Z0-9][A-Z0-9.\-&]*$')
+_TP = re.compile(r'^[A-Z0-9][A-Z0-9.\-&]*$')
 
-def _looks_like_ticker(value):
-    v = value.strip()
+def _is_ticker(v):
+    v=v.strip(); vu=v.upper()
     if not v: return False
-    vu = v.upper()
-    if vu.endswith('.NS') or vu.endswith('.BO') or vu.endswith('.BSE'): return True
+    if vu.endswith('.NS') or vu.endswith('.BO'): return True
     if ' ' in v or any(c.islower() for c in v): return False
-    return len(vu) <= 12 and bool(_TICKER_PATTERN.match(vu))
+    return len(vu)<=12 and bool(_TP.match(vu))
 
-def _search_yahoo_symbol(query):
-    quotes = []
+def _yahoo_search(q):
     try:
-        r = _requests.get("https://query2.finance.yahoo.com/v1/finance/search",
-            params={"q":query,"quotesCount":8,"newsCount":0},
-            headers={"User-Agent":"Mozilla/5.0"}, timeout=6)
-        if r.status_code == 200:
-            quotes = r.json().get("quotes",[])
-    except Exception:
-        pass
-    if not quotes:
-        try:
-            quotes = yf.Search(query, max_results=8).quotes or []
-        except Exception:
-            pass
-    if not quotes: return None
-    eq = [q for q in quotes if q.get("quoteType") in ("EQUITY","ETF",None)] or quotes
-    for q in eq:
-        if q.get("symbol","").endswith(".NS"): return q["symbol"]
-    for q in eq:
-        if q.get("symbol","").endswith(".BO"): return q["symbol"]
-    return eq[0].get("symbol")
+        r=_req.get("https://query2.finance.yahoo.com/v1/finance/search",
+            params={"q":q,"quotesCount":8,"newsCount":0},
+            headers={"User-Agent":"Mozilla/5.0"},timeout=6)
+        if r.status_code==200:
+            qs=r.json().get("quotes",[])
+            eq=[x for x in qs if x.get("quoteType") in ("EQUITY","ETF",None)] or qs
+            for x in eq:
+                if x.get("symbol","").endswith(".NS"): return x["symbol"]
+            for x in eq:
+                if x.get("symbol","").endswith(".BO"): return x["symbol"]
+            if eq: return eq[0].get("symbol")
+    except: pass
+    try:
+        qs=yf.Search(q,max_results=8).quotes or []
+        for x in qs:
+            if x.get("symbol","").endswith(".NS"): return x["symbol"]
+        if qs: return qs[0].get("symbol")
+    except: pass
+    return None
 
 @st.cache_data(ttl=43200, show_spinner=False)
-def resolve_tickers(raw_names_tuple, manual_overrides_tuple):
-    overrides = dict(manual_overrides_tuple)
-    resolved = {}
-    for raw in raw_names_tuple:
-        rc = str(raw).strip()
-        if raw in overrides and overrides[raw]:
-            resolved[raw] = overrides[raw].strip().upper(); continue
-        if not rc:
-            resolved[raw] = None; continue
-        resolved[raw] = rc.upper() if _looks_like_ticker(rc) else _search_yahoo_symbol(rc)
-    return resolved
+def resolve_tickers(raw_t, overrides_t):
+    ov=dict(overrides_t); res={}
+    for r in raw_t:
+        rc=str(r).strip()
+        if r in ov and ov[r]: res[r]=ov[r].strip().upper(); continue
+        if not rc: res[r]=None; continue
+        res[r]=rc.upper() if _is_ticker(rc) else _yahoo_search(rc)
+    return res
 
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_live_prices_from_yahoo(tickers_list):
-    d = {}
-    for t in tickers_list:
+def fetch_prices(tickers):
+    d={}
+    for t in tickers:
         if not t: continue
         try:
-            h = yf.Ticker(t).history(period="2d")
-            d[t] = h['Close'].iloc[-1] if not h.empty else 0
-        except Exception:
-            d[t] = 0
-    return d
-
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_day_change(tickers_list):
-    d = {}
-    for t in tickers_list:
-        if not t: continue
-        try:
-            h = yf.Ticker(t).history(period="2d")
-            if len(h) >= 2:
-                prev,curr,vol = h['Close'].iloc[-2],h['Close'].iloc[-1],h['Volume'].iloc[-1]
-                d[t] = (round((curr-prev)/prev*100,2) if prev>0 else 0, round(prev,2), int(vol))
-            else:
-                d[t] = (0.0,0.0,0)
-        except Exception:
-            d[t] = (0.0,0.0,0)
+            h=yf.Ticker(t).history(period="2d")
+            d[t]=h['Close'].iloc[-1] if not h.empty else 0
+        except: d[t]=0
     return d
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_52week_range(tickers_list):
-    d = {}
-    for t in tickers_list:
+def fetch_52w(tickers):
+    d={}
+    for t in tickers:
         if not t: continue
         try:
-            h = yf.Ticker(t).history(period="1y")
-            d[t] = (h['High'].max(), h['Low'].min()) if not h.empty else (0,0)
-        except Exception:
-            d[t] = (0,0)
+            h=yf.Ticker(t).history(period="1y")
+            d[t]=(h['High'].max(),h['Low'].min()) if not h.empty else (0,0)
+        except: d[t]=(0,0)
     return d
 
 @st.cache_data(ttl=21600, show_spinner=False)
-def fetch_sector_info(tickers_list):
-    d = {}
-    for t in tickers_list:
+def fetch_sectors(tickers):
+    d={}
+    for t in tickers:
         if not t: continue
-        try:
-            d[t] = yf.Ticker(t).info.get('sector') or 'Unknown'
-        except Exception:
-            d[t] = 'Unknown'
+        try: d[t]=yf.Ticker(t).info.get('sector') or 'Unknown'
+        except: d[t]='Unknown'
     return d
 
-# ══════════════════════════════════════════════════════════════════════
-# ★ NEW: MARKET INDICES (Nifty, Sensex, Bank Nifty, Gold)
-# ══════════════════════════════════════════════════════════════════════
 @st.cache_data(ttl=120, show_spinner=False)
-def fetch_market_indices():
-    indices = {"NIFTY 50":"^NSEI","SENSEX":"^BSESN","BANK NIFTY":"^NSEBANK","NIFTY IT":"^CNXIT","GOLD (MCX)":"GC=F"}
-    result = {}
-    for name, sym in indices.items():
+def fetch_indices():
+    idx={"NIFTY 50":"^NSEI","SENSEX":"^BSESN","BANK NIFTY":"^NSEBANK","NIFTY IT":"^CNXIT","GOLD":"GC=F"}
+    res={}
+    for n,s in idx.items():
         try:
-            h = yf.Ticker(sym).history(period="2d")
-            if len(h) >= 2:
-                curr,prev = h['Close'].iloc[-1],h['Close'].iloc[-2]
-                result[name] = (round(curr,2), round((curr-prev)/prev*100,2))
+            h=yf.Ticker(s).history(period="2d")
+            if len(h)>=2:
+                c,p=h['Close'].iloc[-1],h['Close'].iloc[-2]
+                res[n]=(round(c,2),round((c-p)/p*100,2))
             elif len(h)==1:
-                result[name] = (round(h['Close'].iloc[-1],2), 0.0)
-        except Exception:
-            pass
-    return result
+                res[n]=(round(h['Close'].iloc[-1],2),0.0)
+        except: pass
+    return res
 
-# ══════════════════════════════════════════════════════════════════════
-# ★ NEW: NEWS FEED via Yahoo Finance RSS
-# ══════════════════════════════════════════════════════════════════════
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_stock_news(tickers_list, max_per_ticker=4):
-    """Fetch news using Google News RSS (best Indian stock coverage) + ET Markets RSS.
-    Returns articles from the last 2 weeks only, sorted newest first."""
-    from email.utils import parsedate_to_datetime
-    import time
-
-    two_weeks_ago = datetime.now(timezone.utc) - timedelta(days=14)
-    all_news = []
-    seen_titles = set()
-
-    # 1. Google News RSS per ticker (best for Indian stocks)
-    for ticker in list(tickers_list)[:20]:
-        if not ticker:
-            continue
-        # Strip exchange suffix for more natural search
-        clean_name = ticker.replace(".NS", "").replace(".BO", "").replace(".BSE", "")
-        search_terms = [
-            f"https://news.google.com/rss/search?q={clean_name}+stock+NSE&hl=en-IN&gl=IN&ceid=IN:en",
-            f"https://news.google.com/rss/search?q={clean_name}+shares&hl=en-IN&gl=IN&ceid=IN:en",
-        ]
-        for url in search_terms:
-            try:
-                feed = feedparser.parse(url)
-                for entry in feed.entries[:max_per_ticker]:
-                    title = entry.get("title", "").strip()
-                    if not title or title in seen_titles:
-                        continue
-                    # Parse date and filter last 2 weeks
-                    pub_str = entry.get("published", "")
-                    try:
-                        pub_dt = parsedate_to_datetime(pub_str) if pub_str else None
-                        if pub_dt and pub_dt < two_weeks_ago:
-                            continue  # skip older than 2 weeks
-                        pub_display = pub_dt.strftime("%d %b %Y, %H:%M") if pub_dt else pub_str[:16]
-                    except Exception:
-                        pub_display = pub_str[:16]
-                        pub_dt = None
-
-                    seen_titles.add(title)
-                    all_news.append({
-                        "ticker": ticker,
-                        "title": title,
-                        "link": entry.get("link", "#"),
-                        "published": pub_display,
-                        "pub_dt": pub_dt,
-                        "source": entry.get("source", {}).get("title", "Google News") if hasattr(entry.get("source", ""), "get") else "Google News",
-                        "summary": entry.get("summary", "")[:200] if entry.get("summary") else "",
-                    })
-            except Exception:
-                pass
-
-    # 2. Indian Finance RSS Feeds (broad market coverage)
-    indian_feeds = [
-        ("Economic Times Markets", "https://economictimes.indiatimes.com/markets/stocks/rss.cms"),
-        ("ET Corporate News",       "https://economictimes.indiatimes.com/news/company/corporate-trends/rssfeeds/2143429.cms"),
-        ("Business Standard",       "https://www.business-standard.com/rss/markets-106.rss"),
-        ("Moneycontrol News",       "https://www.moneycontrol.com/rss/latestnews.xml"),
-        ("LiveMint Markets",        "https://www.livemint.com/rss/markets"),
-    ]
-    for source_name, url in indian_feeds:
-        try:
-            feed = feedparser.parse(url)
-            for entry in feed.entries[:5]:
-                title = entry.get("title", "").strip()
-                if not title or title in seen_titles:
-                    continue
-                pub_str = entry.get("published", "")
-                try:
-                    pub_dt = parsedate_to_datetime(pub_str) if pub_str else None
-                    if pub_dt and pub_dt < two_weeks_ago:
-                        continue
-                    pub_display = pub_dt.strftime("%d %b %Y, %H:%M") if pub_dt else pub_str[:16]
-                except Exception:
-                    pub_display = pub_str[:16]
-                    pub_dt = None
-                seen_titles.add(title)
-                all_news.append({
-                    "ticker": "📰 Market",
-                    "title": title,
-                    "link": entry.get("link", "#"),
-                    "published": pub_display,
-                    "pub_dt": pub_dt,
-                    "source": source_name,
-                    "summary": entry.get("summary", "")[:200] if entry.get("summary") else "",
-                })
-        except Exception:
-            pass
-
-    # Sort by date newest first, put None dates at end
-    all_news.sort(
-        key=lambda x: x["pub_dt"] if x["pub_dt"] else datetime(2000, 1, 1, tzinfo=timezone.utc),
-        reverse=True
-    )
-    return all_news[:60]
-
-# ══════════════════════════════════════════════════════════════════════
-# ★ NEW: BENCHMARK COMPARISON (Portfolio vs Nifty 50)
-# ══════════════════════════════════════════════════════════════════════
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_benchmark_returns(period="1y"):
+def fetch_benchmark(period="1y"):
     try:
-        h = yf.Ticker("^NSEI").history(period=period)
+        h=yf.Ticker("^NSEI").history(period=period)
         if not h.empty:
-            start,end = h['Close'].iloc[0], h['Close'].iloc[-1]
-            return round((end-start)/start*100, 2), h
-    except Exception:
-        pass
+            return round((h['Close'].iloc[-1]-h['Close'].iloc[0])/h['Close'].iloc[0]*100,2), h
+    except: pass
     return None, pd.DataFrame()
 
-# ══════════════════════════════════════════════════════════════════════
-# ★ NEW: TELEGRAM ALERT
-# ══════════════════════════════════════════════════════════════════════
-def send_telegram_alert(bot_token, chat_id, message):
-    """Send a Telegram message via Bot API. Returns (success, msg)."""
+@st.cache_data(ttl=10, show_spinner=False)
+def fetch_suggestions(q):
+    if not q or len(q.strip())<2: return []
+    s=[]
     try:
-        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        r = _requests.post(url, json={"chat_id":chat_id,"text":message,"parse_mode":"HTML"}, timeout=8)
+        r=_req.get("https://query2.finance.yahoo.com/v1/finance/search",
+            params={"q":q,"quotesCount":10,"newsCount":0},
+            headers={"User-Agent":"Mozilla/5.0"},timeout=4)
+        if r.status_code==200:
+            for x in r.json().get("quotes",[]):
+                if x.get("quoteType") not in ("EQUITY","ETF","MUTUALFUND",None): continue
+                s.append({"label":f"{x.get('longname') or x.get('shortname') or x.get('symbol')}  —  {x.get('symbol')}  [{x.get('exchange','')}]","ticker":x.get("symbol",""),"name":x.get("longname") or x.get("shortname") or ""})
+    except: pass
+    if not s:
+        try:
+            for x in (yf.Search(q,max_results=10).quotes or []):
+                s.append({"label":f"{x.get('longname') or x.get('shortname') or x.get('symbol')}  —  {x.get('symbol')}","ticker":x.get("symbol",""),"name":x.get("longname") or ""})
+        except: pass
+    return s[:10]
+
+@st.cache_data(ttl=60, show_spinner=False)
+def search_stock_full(ticker):
+    try:
+        tk=yf.Ticker(ticker)
+        h1d=tk.history(period="1d"); h1y=tk.history(period="1y")
+        if h1d.empty: return None
+        try: info=tk.info; cn=info.get('longName') or info.get('shortName') or ticker; cur=info.get('currency','')
+        except: cn=ticker; cur=''
+        return {"ticker":ticker,"company_name":cn,"currency":cur,"live_price":h1d['Close'].iloc[-1],
+                "high_52w":h1y['High'].max() if not h1y.empty else None,
+                "low_52w":h1y['Low'].min() if not h1y.empty else None,"history":h1y}
+    except: return None
+
+# ══════════════════════════════════════════════════════════════════════
+# TECHNICAL INDICATORS
+# ══════════════════════════════════════════════════════════════════════
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_technicals(ticker, period="6mo"):
+    """Fetch OHLCV and compute RSI, MACD, Bollinger Bands, Moving Averages."""
+    try:
+        h = yf.Ticker(ticker).history(period=period)
+        if h.empty or len(h) < 30: return None
+        close = h['Close']
+        # Moving Averages
+        h['MA20']  = close.rolling(20).mean()
+        h['MA50']  = close.rolling(50).mean()
+        h['MA200'] = close.rolling(200).mean()
+        # RSI (14)
+        delta = close.diff()
+        gain  = delta.clip(lower=0).rolling(14).mean()
+        loss  = (-delta.clip(upper=0)).rolling(14).mean()
+        rs    = gain / loss.replace(0, 1e-10)
+        h['RSI'] = 100 - (100 / (1 + rs))
+        # MACD
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        h['MACD']        = ema12 - ema26
+        h['MACD_Signal'] = h['MACD'].ewm(span=9, adjust=False).mean()
+        h['MACD_Hist']   = h['MACD'] - h['MACD_Signal']
+        # Bollinger Bands (20, 2σ)
+        h['BB_Mid']   = close.rolling(20).mean()
+        h['BB_Upper'] = h['BB_Mid'] + 2 * close.rolling(20).std()
+        h['BB_Lower'] = h['BB_Mid'] - 2 * close.rolling(20).std()
+        # Volume MA
+        h['Vol_MA20'] = h['Volume'].rolling(20).mean()
+        return h.dropna(subset=['MA20','RSI','MACD'])
+    except: return None
+
+def get_technical_signal(df):
+    """Quick signal summary from latest indicator values."""
+    last = df.iloc[-1]
+    signals = []
+    rsi = last.get('RSI', 50)
+    if rsi < 30:   signals.append(("RSI", "Oversold 🟢", "#3fb950"))
+    elif rsi > 70: signals.append(("RSI", "Overbought 🔴", "#f85149"))
+    else:          signals.append(("RSI", f"Neutral ({rsi:.0f})", "#8b949e"))
+    macd = last.get('MACD', 0); sig = last.get('MACD_Signal', 0)
+    if macd > sig: signals.append(("MACD", "Bullish ↑ 🟢", "#3fb950"))
+    else:          signals.append(("MACD", "Bearish ↓ 🔴", "#f85149"))
+    close = last['Close']; bb_u = last.get('BB_Upper'); bb_l = last.get('BB_Lower')
+    if bb_u and close > bb_u:      signals.append(("Bollinger", "Above Upper Band ⚠️", "#e3b341"))
+    elif bb_l and close < bb_l:    signals.append(("Bollinger", "Below Lower Band 🟢", "#3fb950"))
+    else:                          signals.append(("Bollinger", "Inside Bands", "#8b949e"))
+    ma20 = last.get('MA20'); ma50 = last.get('MA50')
+    if ma20 and ma50:
+        if close > ma20 > ma50:    signals.append(("Trend", "Strong Uptrend 🟢", "#3fb950"))
+        elif close < ma20 < ma50:  signals.append(("Trend", "Strong Downtrend 🔴", "#f85149"))
+        else:                      signals.append(("Trend", "Mixed / Sideways", "#8b949e"))
+    return signals
+
+# ══════════════════════════════════════════════════════════════════════
+# OPTIONS CHAIN
+# ══════════════════════════════════════════════════════════════════════
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_options(ticker):
+    """Fetch options chain from Yahoo Finance for a given ticker."""
+    try:
+        tk = yf.Ticker(ticker)
+        exp_dates = tk.options
+        if not exp_dates: return None, None, []
+        nearest_exp = exp_dates[0]
+        chain = tk.option_chain(nearest_exp)
+        calls = chain.calls[['strike','lastPrice','bid','ask','volume','openInterest','impliedVolatility']].copy()
+        puts  = chain.puts[['strike','lastPrice','bid','ask','volume','openInterest','impliedVolatility']].copy()
+        calls.columns = ['Strike','Last','Bid','Ask','Volume','OI','IV']
+        puts.columns  = ['Strike','Last','Bid','Ask','Volume','OI','IV']
+        calls['IV'] = (calls['IV'] * 100).round(2)
+        puts['IV']  = (puts['IV']  * 100).round(2)
+        return calls, puts, list(exp_dates)
+    except: return None, None, []
+
+# ══════════════════════════════════════════════════════════════════════
+# MUTUAL FUND TRACKER
+# ══════════════════════════════════════════════════════════════════════
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_mf_nav(scheme_code):
+    """Fetch MF NAV from AMFI India API (free, no auth needed)."""
+    try:
+        r = _req.get(f"https://api.mfapi.in/mf/{scheme_code}", timeout=8)
         if r.status_code == 200:
-            return True, "Telegram sent"
-        return False, r.text
-    except Exception as e:
-        return False, str(e)
+            data = r.json()
+            meta = data.get('meta', {})
+            nav_data = data.get('data', [])
+            if nav_data:
+                latest = nav_data[0]
+                hist_df = pd.DataFrame(nav_data[:365])
+                hist_df['date'] = pd.to_datetime(hist_df['date'], format='%d-%m-%Y', errors='coerce')
+                hist_df['nav']  = pd.to_numeric(hist_df['nav'], errors='coerce')
+                hist_df = hist_df.sort_values('date')
+                return {
+                    "scheme_name": meta.get('scheme_name',''),
+                    "fund_house":  meta.get('fund_house',''),
+                    "scheme_type": meta.get('scheme_type',''),
+                    "nav":         float(latest.get('nav', 0)),
+                    "nav_date":    latest.get('date',''),
+                    "history":     hist_df,
+                    "1m_return":   _mf_return(hist_df, 30),
+                    "3m_return":   _mf_return(hist_df, 90),
+                    "1y_return":   _mf_return(hist_df, 365),
+                }
+    except: pass
+    return None
 
-# ══════════════════════════════════════════════════════════════════════
-# EMAIL
-# ══════════════════════════════════════════════════════════════════════
-def send_email_alert(sender_email, app_password, recipient_email, subject, body):
+@st.cache_data(ttl=86400, show_spinner=False)
+def search_mf(query):
+    """Search AMFI scheme list for matching fund names."""
     try:
-        msg = MIMEMultipart("alternative")
-        msg['Subject'] = subject
-        msg['From'] = sender_email
-        msg['To'] = recipient_email
-        msg.attach(MIMEText(body, "plain"))
-        ctx = ssl.create_default_context()
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx) as s:
-            s.login(sender_email, app_password)
-            s.sendmail(sender_email, recipient_email, msg.as_string())
-        return True, "Email sent"
-    except Exception as e:
-        return False, str(e)
+        r = _req.get("https://api.mfapi.in/mf/search?q=" + _req.utils.quote(query), timeout=6)
+        if r.status_code == 200:
+            return r.json()[:20]
+    except: pass
+    return []
 
-def _dispatch_alert(subject, body, settings, ticker=""):
-    """Send via Email and/or Telegram based on saved settings."""
-    sent = []
-    if settings.get("email_enabled") and settings.get("email_sender") and settings.get("email_password"):
-        ok, msg = send_email_alert(settings["email_sender"], settings["email_password"],
-                                   settings.get("email_recipient", settings["email_sender"]), subject, body)
-        sent.append(("Email", ok, msg))
-    if settings.get("telegram_enabled") and settings.get("telegram_token") and settings.get("telegram_chat_id"):
-        ok, msg = send_telegram_alert(settings["telegram_token"], settings["telegram_chat_id"], f"<b>{subject}</b>\n\n{body}")
-        sent.append(("Telegram", ok, msg))
-    return sent
+def _mf_return(hist_df, days):
+    try:
+        cutoff = hist_df['date'].max() - timedelta(days=days)
+        old = hist_df[hist_df['date'] <= cutoff]
+        if old.empty: return None
+        old_nav = old.iloc[-1]['nav']
+        new_nav = hist_df.iloc[-1]['nav']
+        return round((new_nav - old_nav) / old_nav * 100, 2)
+    except: return None
 
 # ══════════════════════════════════════════════════════════════════════
-# 52-WEEK ALERTS
+# NEWS
 # ══════════════════════════════════════════════════════════════════════
-def check_52week_alerts(df_pos, already_alerted_set, settings):
-    for _, row in df_pos.iterrows():
-        ticker = row.get('resolved_ticker')
-        live = row.get('live_price', 0)
-        h52, l52 = row.get('high_52w',0), row.get('low_52w',0)
-        name = row.get('share_name', ticker)
-        if not ticker or live==0: continue
-        for key, flag, price_key, label, emoji in [
-            (f"{ticker}_52H", h52 and live>=h52, h52, "52-WEEK HIGH", "📈"),
-            (f"{ticker}_52L", l52 and live<=l52, l52, "52-WEEK LOW",  "📉"),
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_news(tickers_t, max_per=4):
+    from email.utils import parsedate_to_datetime
+    two_w = datetime.now(timezone.utc) - timedelta(days=14)
+    all_n=[]; seen=set()
+    for t in list(tickers_t)[:20]:
+        if not t: continue
+        clean = t.replace(".NS","").replace(".BO","")
+        for url in [
+            f"https://news.google.com/rss/search?q={clean}+stock+NSE&hl=en-IN&gl=IN&ceid=IN:en",
+            f"https://news.google.com/rss/search?q={clean}+shares+India&hl=en-IN&gl=IN&ceid=IN:en",
         ]:
-            if flag and key not in already_alerted_set:
-                subj = f"{emoji} {label} Alert: {name} ({ticker})"
-                body = (f"{name} has touched its {label}.\n"
-                        f"Current Price: ₹{live:,.2f}\n"
-                        f"{label}: ₹{price_key:,.2f}\n"
-                        f"Time (IST): {now_ist().strftime('%Y-%m-%d %H:%M:%S')}")
-                _dispatch_alert(subj, body, settings)
-                already_alerted_set.add(key)
+            try:
+                fd=feedparser.parse(url)
+                for e in fd.entries[:max_per]:
+                    title=e.get("title","").strip()
+                    if not title or title in seen: continue
+                    pub_s=e.get("published","")
+                    try:
+                        dt=parsedate_to_datetime(pub_s)
+                        if dt < two_w: continue
+                        pd_=dt.strftime("%d %b %Y, %H:%M")
+                    except: dt=None; pd_=pub_s[:16]
+                    seen.add(title)
+                    all_n.append({"ticker":t,"title":title,"link":e.get("link","#"),
+                                  "published":pd_,"pub_dt":dt,
+                                  "source":"Google News",
+                                  "summary":e.get("summary","")[:180] if e.get("summary") else ""})
+            except: pass
+    for src,url in [
+        ("Economic Times","https://economictimes.indiatimes.com/markets/stocks/rss.cms"),
+        ("Business Standard","https://www.business-standard.com/rss/markets-106.rss"),
+        ("Moneycontrol","https://www.moneycontrol.com/rss/latestnews.xml"),
+        ("LiveMint","https://www.livemint.com/rss/markets"),
+    ]:
+        try:
+            fd=feedparser.parse(url)
+            for e in fd.entries[:5]:
+                title=e.get("title","").strip()
+                if not title or title in seen: continue
+                pub_s=e.get("published","")
+                try:
+                    from email.utils import parsedate_to_datetime as p2d
+                    dt=p2d(pub_s)
+                    if dt < two_w: continue
+                    pd_=dt.strftime("%d %b %Y, %H:%M")
+                except: dt=None; pd_=pub_s[:16]
+                seen.add(title)
+                all_n.append({"ticker":"📰 Market","title":title,"link":e.get("link","#"),
+                              "published":pd_,"pub_dt":dt,"source":src,
+                              "summary":e.get("summary","")[:180] if e.get("summary") else ""})
+        except: pass
+    all_n.sort(key=lambda x: x["pub_dt"] if x["pub_dt"] else datetime(2000,1,1,tzinfo=timezone.utc), reverse=True)
+    return all_n[:60]
 
 # ══════════════════════════════════════════════════════════════════════
-# ★ NEW: PRICE ALERTS (target/stop)
+# AI ADVISOR (Claude API)
 # ══════════════════════════════════════════════════════════════════════
-def check_price_alerts(live_prices_map, already_alerted_set, settings):
-    """Check user-set target/stop alerts against current live prices."""
-    alerts = load_price_alerts()
-    triggered = []
-    for ticker, al in alerts.items():
-        live = live_prices_map.get(ticker, 0)
-        if live == 0: continue
-        for kind, threshold, emoji in [
-            ("target", al.get("target"), "🎯"),
-            ("stop",   al.get("stop"),   "🛑"),
-        ]:
-            if not threshold: continue
-            key = f"{ticker}_{kind}_{threshold}"
-            hit = (kind=="target" and live >= threshold) or (kind=="stop" and live <= threshold)
-            if hit and key not in already_alerted_set:
-                label = "TARGET HIT" if kind=="target" else "STOP LOSS HIT"
-                subj = f"{emoji} {label}: {ticker}"
-                body = (f"{ticker} has {label}.\n"
-                        f"Alert Price: ₹{threshold:,.2f}\n"
-                        f"Current Price: ₹{live:,.2f}\n"
-                        f"Time (IST): {now_ist().strftime('%Y-%m-%d %H:%M:%S')}")
-                _dispatch_alert(subj, body, settings)
-                already_alerted_set.add(key)
-                triggered.append((ticker, label, live, threshold))
-    return triggered
+def rule_based_advisor(df_port, question_type="general", user_question=""):
+    """Free, no-API-key rule-based portfolio advisor. Analyzes the actual holdings data
+    using fixed financial rules (concentration, sector exposure, momentum, drawdown, tax)
+    and returns a formatted text response — no external AI call needed."""
+    if df_port is None or df_port.empty:
+        return "📭 No portfolio data loaded yet. Upload your holdings file first so I can analyze it."
+
+    d = df_port.copy()
+    total_inv = d['Invested'].sum()
+    total_cur = d['Current'].sum() if 'Current' in d.columns else total_inv
+    total_pnl = total_cur - total_inv
+    ret_pct   = (total_pnl/total_inv*100) if total_inv > 0 else 0
+    n_stocks  = len(d['share_name'].unique())
+    win_rate  = (d['PnL']>0).sum()/max(len(d),1)*100 if 'PnL' in d.columns else 0
+    max_w     = d['Weight'].max() if 'Weight' in d.columns else 0
+    max_w_stock = d.loc[d['Weight'].idxmax(),'share_name'] if 'Weight' in d.columns and not d.empty else "N/A"
+    best = d.loc[d['Returns_Pct'].idxmax()] if 'Returns_Pct' in d.columns and not d.empty else None
+    worst = d.loc[d['Returns_Pct'].idxmin()] if 'Returns_Pct' in d.columns and not d.empty else None
+    losers = d[d['PnL']<0].sort_values('Returns_Pct').head(5) if 'PnL' in d.columns else pd.DataFrame()
+    gainers = d[d['PnL']>0].sort_values('Returns_Pct',ascending=False).head(5) if 'PnL' in d.columns else pd.DataFrame()
+
+    lines = []
+
+    if question_type == "health":
+        lines.append(f"## 🔍 Portfolio Health Check\n")
+        lines.append(f"**Overview:** {n_stocks} stocks | Invested ₹{total_inv:,.0f} | Current ₹{total_cur:,.0f} | P&L **₹{total_pnl:+,.0f} ({ret_pct:+.2f}%)**\n")
+        lines.append(f"**Win Rate:** {win_rate:.1f}% of holdings are profitable\n")
+        if max_w > 25:
+            lines.append(f"⚠️ **Concentration Risk:** {max_w_stock} is {max_w:.1f}% of your portfolio — well above the recommended 15-20% single-stock cap. Consider trimming.")
+        elif max_w > 15:
+            lines.append(f"🟡 **Moderate Concentration:** {max_w_stock} is {max_w:.1f}% of portfolio — keep an eye on this.")
+        else:
+            lines.append(f"✅ **Good Diversification:** No single stock exceeds 15% — healthy spread.")
+        if n_stocks < 10:
+            lines.append(f"\n⚠️ Only {n_stocks} stocks held — consider diversifying further (15-20 stocks is typically a good range for retail portfolios).")
+        elif n_stocks > 40:
+            lines.append(f"\n🟡 {n_stocks} stocks is quite high — over-diversification can dilute returns and make tracking difficult.")
+        if ret_pct < 0:
+            lines.append(f"\n📉 Portfolio currently in loss. Review underperformers below before deciding to average down or exit.")
+        if not losers.empty:
+            lines.append(f"\n**Biggest drags on portfolio:**")
+            for _,r in losers.iterrows():
+                lines.append(f"- {r['share_name']}: {r['Returns_Pct']:+.1f}% (₹{r['PnL']:+,.0f})")
+
+    elif question_type == "risk":
+        lines.append(f"## ⚠️ Risk Assessment\n")
+        high_risk = d[d['Weight']>15].sort_values('Weight',ascending=False) if 'Weight' in d.columns else pd.DataFrame()
+        if not high_risk.empty:
+            lines.append(f"**Stocks above 15% weight (concentration risk):**")
+            for _,r in high_risk.iterrows():
+                lines.append(f"- {r['share_name']}: {r['Weight']:.1f}% of portfolio")
+        else:
+            lines.append("✅ No major single-stock concentration risk detected.")
+        if 'Sector' in d.columns:
+            sec = d.groupby('Sector')['Invested'].sum()
+            sec_pct = (sec/sec.sum()*100).sort_values(ascending=False)
+            top_sec = sec_pct.index[0] if len(sec_pct)>0 else None
+            if top_sec and sec_pct.iloc[0] > 35:
+                lines.append(f"\n⚠️ **Sector Concentration:** {sec_pct.iloc[0]:.1f}% of capital is in **{top_sec}** sector — consider diversifying across sectors.")
+        big_losers = d[d['Returns_Pct']<-20] if 'Returns_Pct' in d.columns else pd.DataFrame()
+        if not big_losers.empty:
+            lines.append(f"\n🔴 **{len(big_losers)} stock(s) down more than 20%:** " + ", ".join(big_losers['share_name'].tolist()))
+        lines.append(f"\n**Overall Volatility Indicator:** {'High' if d['Returns_Pct'].std() > 25 else 'Moderate' if d['Returns_Pct'].std() > 12 else 'Low'} (std dev of returns: {d['Returns_Pct'].std():.1f}%)" if 'Returns_Pct' in d.columns else "")
+
+    elif question_type == "rebalance":
+        lines.append(f"## 📈 Rebalancing Suggestions\n")
+        if max_w > 20:
+            lines.append(f"1. **Trim {max_w_stock}** — currently {max_w:.1f}% of portfolio. Consider reducing to ~15% and redeploying into underweight quality names.")
+        if not gainers.empty:
+            lines.append(f"\n2. **Consider partial profit-booking on top gainers:**")
+            for _,r in gainers.head(3).iterrows():
+                lines.append(f"   - {r['share_name']}: +{r['Returns_Pct']:.1f}% — lock in some gains if it now exceeds your target allocation.")
+        if not losers.empty:
+            lines.append(f"\n3. **Review these underperformers** — decide if the thesis still holds, or if it's time to cut losses:")
+            for _,r in losers.head(3).iterrows():
+                lines.append(f"   - {r['share_name']}: {r['Returns_Pct']:+.1f}%")
+        lines.append(f"\n4. **Diversification check:** {n_stocks} stocks held. " + ("Consider adding 3-5 more names across uncovered sectors." if n_stocks<12 else "Allocation count looks reasonable."))
+
+    elif question_type == "tax":
+        lines.append(f"## 🧾 Tax Optimization (STCG vs LTCG)\n")
+        lines.append("Indian capital gains tax rules: **STCG (held <1yr) taxed @20%**, **LTCG (held >1yr) taxed @12.5%** above ₹1 lakh exemption per year.\n")
+        lines.append("**General tax-saving strategies based on your holdings:**")
+        if not losers.empty:
+            lines.append(f"- **Tax-loss harvesting:** You have {len(d[d['PnL']<0])} stock(s) in loss. Booking losses before March 31st can offset gains elsewhere and reduce your tax bill (subject to your specific situation — consult a CA).")
+        if not gainers.empty:
+            lines.append(f"- For profitable holdings nearing the 1-year mark, **waiting until LTCG eligibility** (>365 days) can cut your tax rate roughly in half (20%→12.5%).")
+        lines.append(f"- Each financial year, the first **₹1 lakh of LTCG is tax-free** — consider booking profits up to this threshold annually if you have long-held winners.")
+        lines.append("\n⚠️ This is general guidance, not professional tax advice. Please consult a Chartered Accountant for your specific tax filing.")
+
+    elif question_type == "sector":
+        lines.append(f"## 📊 Sector Diversification Review\n")
+        if 'Sector' in d.columns:
+            sec = d.groupby('Sector')['Invested'].sum().sort_values(ascending=False)
+            sec_pct = (sec/sec.sum()*100)
+            lines.append("**Current sector allocation:**")
+            for sname, pct in sec_pct.items():
+                flag = " ⚠️ (overweight)" if pct > 35 else (" 🟢" if pct < 20 else "")
+                lines.append(f"- {sname}: {pct:.1f}%{flag}")
+            if sec_pct.iloc[0] > 35:
+                lines.append(f"\n⚠️ Heavy concentration in **{sec_pct.index[0]}** ({sec_pct.iloc[0]:.1f}%). A market downturn specific to this sector could disproportionately hurt your portfolio.")
+            if len(sec_pct) < 4:
+                lines.append(f"\n🟡 Only {len(sec_pct)} sector(s) represented — consider spreading across more sectors (Financials, IT, Pharma, FMCG, Energy, Auto, etc.) to reduce correlated risk.")
+        else:
+            lines.append("Sector data not available — visit Overview Dashboard first to load sector classification.")
+
+    elif question_type == "buysell":
+        lines.append(f"## 💡 Holdings-Based Observations\n")
+        lines.append("*(Not investment advice — these are data-driven observations from your current holdings only.)*\n")
+        if not gainers.empty:
+            lines.append(f"**Strong performers (consider your target allocation):**")
+            for _,r in gainers.head(3).iterrows():
+                tag = "🎯 At/near take-profit zone" if r.get('Returns_Pct',0) >= 20 else "📈 Performing well"
+                lines.append(f"- {r['share_name']}: {r['Returns_Pct']:+.1f}% — {tag}")
+        if not losers.empty:
+            lines.append(f"\n**Underperformers (review thesis):**")
+            for _,r in losers.head(3).iterrows():
+                tag = "🛑 Near stop-loss zone" if r.get('Returns_Pct',0) <= -10 else "📉 Watch closely"
+                lines.append(f"- {r['share_name']}: {r['Returns_Pct']:+.1f}% — {tag}")
+        lines.append(f"\nUse the **Technical Indicators** tab for RSI/MACD signals on specific stocks before deciding.")
+
+    else:  # free-form question matching
+        q = user_question.lower()
+        if any(w in q for w in ["sell","exit","reduce","trim"]):
+            lines.append("### 💡 Stocks to review for selling/trimming:\n")
+            if not losers.empty:
+                for _,r in losers.head(5).iterrows():
+                    lines.append(f"- **{r['share_name']}**: {r['Returns_Pct']:+.1f}% (₹{r['PnL']:+,.0f}) — biggest underperformer")
+            if max_w > 20:
+                lines.append(f"\n- **{max_w_stock}** is {max_w:.1f}% of your portfolio — consider trimming for concentration risk.")
+        elif any(w in q for w in ["tax","stcg","ltcg"]):
+            return rule_based_advisor(df_port, "tax")
+        elif any(w in q for w in ["risk","concentrat","diversif"]):
+            return rule_based_advisor(df_port, "risk")
+        elif any(w in q for w in ["sector"]):
+            return rule_based_advisor(df_port, "sector")
+        elif any(w in q for w in ["rebalanc"]):
+            return rule_based_advisor(df_port, "rebalance")
+        elif any(w in q for w in ["rsi","macd","bollinger","technical","indicator"]):
+            lines.append("### 📊 Technical Indicators Explained\n")
+            lines.append("- **RSI (Relative Strength Index):** Measures momentum 0-100. Above 70 = potentially overbought, below 30 = potentially oversold.")
+            lines.append("- **MACD:** Shows trend direction via moving average crossovers. MACD crossing above signal line = bullish; below = bearish.")
+            lines.append("- **Bollinger Bands:** Price bands based on volatility. Price near upper band = potentially overbought; near lower band = potentially oversold.")
+            lines.append("\nVisit the **📊 Technical Indicators** tab to see these live for any stock in your portfolio.")
+        elif any(w in q for w in ["defensiv","safe","stable"]):
+            lines.append("### 🛡️ Defensive Stock Categories (General Education)\n")
+            lines.append("Defensive sectors typically include: **FMCG** (consumer staples — demand stays steady), **Pharma** (healthcare needs are non-discretionary), and **Utilities** (power, water).")
+            lines.append("\nThese tend to be less volatile during market downturns compared to high-beta sectors like IT or Realty. Use the **Sector Allocation** chart on Overview Dashboard to see your current defensive exposure.")
+            lines.append("\n⚠️ This is general market education, not a specific stock recommendation.")
+        else:
+            lines.append(f"### 📋 Quick Portfolio Snapshot\n")
+            lines.append(f"You have **{n_stocks} stocks**, total invested ₹{total_inv:,.0f}, currently worth ₹{total_cur:,.0f} ({ret_pct:+.2f}%).")
+            lines.append(f"\nTry asking about: **risk**, **rebalancing**, **tax**, **sector diversification**, or **which stocks to review**.")
+
+    return "\n".join(lines) if lines else "I couldn't generate a specific answer — try rephrasing, or use the Auto Analysis tab for a structured report."
+
+
+def build_portfolio_context(df_port):
+    """Build a concise portfolio summary string (used for display/debug, not an external API)."""
+    if df_port is None or df_port.empty: return "No portfolio data available."
+    total_inv = df_port['Invested'].sum()
+    total_cur = df_port['Current'].sum() if 'Current' in df_port.columns else 0
+    total_pnl = (total_cur - total_inv) if total_cur else 0
+    ret_pct   = (total_pnl / total_inv * 100) if total_inv > 0 else 0
+    top5 = df_port.nlargest(5,'Invested')[['share_name','Invested','Returns_Pct']].to_string(index=False) if 'Returns_Pct' in df_port.columns else "N/A"
+    worst3 = df_port.nsmallest(3,'Returns_Pct')[['share_name','Returns_Pct']].to_string(index=False) if 'Returns_Pct' in df_port.columns else "N/A"
+    n = len(df_port['share_name'].unique())
+    return (f"Portfolio: {n} stocks, Invested ₹{total_inv:,.0f}, Current ₹{total_cur:,.0f}, "
+            f"P&L ₹{total_pnl:,.0f} ({ret_pct:+.2f}%)\n"
+            f"Top 5 holdings by value:\n{top5}\n"
+            f"Worst 3 performers:\n{worst3}")
+
+# ══════════════════════════════════════════════════════════════════════
+# EMAIL + TELEGRAM
+# ══════════════════════════════════════════════════════════════════════
+def send_email(sender, pwd, recipient, subject, body):
+    try:
+        msg=MIMEMultipart(); msg['Subject']=subject; msg['From']=sender; msg['To']=recipient
+        msg.attach(MIMEText(body,"plain"))
+        with smtplib.SMTP_SSL("smtp.gmail.com",465,context=ssl.create_default_context()) as s:
+            s.login(sender,pwd); s.sendmail(sender,recipient,msg.as_string())
+        return True,""
+    except Exception as e: return False,str(e)
+
+def send_telegram(token, chat_id, text):
+    try:
+        r=_req.post(f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id":chat_id,"text":text,"parse_mode":"HTML"},timeout=8)
+        return r.status_code==200, r.text
+    except Exception as e: return False,str(e)
+
+def dispatch(subj, body, cfg):
+    if cfg.get("email_enabled") and cfg.get("email_sender") and cfg.get("email_password"):
+        send_email(cfg["email_sender"],cfg["email_password"],cfg.get("email_recipient",cfg["email_sender"]),subj,body)
+    if cfg.get("telegram_enabled") and cfg.get("telegram_token") and cfg.get("telegram_chat_id"):
+        send_telegram(cfg["telegram_token"],cfg["telegram_chat_id"],f"<b>{subj}</b>\n\n{body}")
 
 # ══════════════════════════════════════════════════════════════════════
 # FIFO + XIRR
 # ══════════════════════════════════════════════════════════════════════
-def compute_fifo_realized_pnl(df_tx):
+def compute_fifo(df_tx):
     if df_tx.empty: return pd.DataFrame(), pd.DataFrame()
-    realized_rows, open_lots_rows = [], []
-    for share_name, group in df_tx.sort_values('date').groupby('share_name'):
-        buy_queue = []
-        for _, row in group.iterrows():
-            qty = float(row['quantity']); price = float(row['price']); date = row['date']
-            ticker = row.get('ticker','')
-            if str(row['txn_type']).upper() == 'BUY':
-                buy_queue.append({"date":date,"qty":qty,"price":price})
-            elif str(row['txn_type']).upper() == 'SELL':
-                qty_to_sell = qty
-                while qty_to_sell > 1e-9 and buy_queue:
-                    lot = buy_queue[0]
-                    matched_qty = min(lot['qty'], qty_to_sell)
-                    holding_days = (date-lot['date']).days if pd.notna(date) and pd.notna(lot['date']) else 0
-                    realized_rows.append({"share_name":share_name,"ticker":ticker,"sell_date":date,"buy_date":lot['date'],
-                        "quantity":matched_qty,"buy_price":lot['price'],"sell_price":price,
-                        "realized_pnl":(price-lot['price'])*matched_qty,"holding_days":holding_days,
-                        "tax_term":"LTCG (>1yr)" if holding_days>365 else "STCG (<1yr)"})
-                    lot['qty'] -= matched_qty; qty_to_sell -= matched_qty
-                    if lot['qty'] <= 1e-9: buy_queue.pop(0)
-        for lot in buy_queue:
-            if lot['qty'] > 1e-9:
-                open_lots_rows.append({"share_name":share_name,"buy_date":lot['date'],"quantity":lot['qty'],"buy_price":lot['price']})
-    return pd.DataFrame(realized_rows), pd.DataFrame(open_lots_rows)
+    rr=[]; ol=[]
+    for sn,grp in df_tx.sort_values('date').groupby('share_name'):
+        q=[]
+        for _,row in grp.iterrows():
+            qty=float(row['quantity']); price=float(row['price']); dt=row['date']
+            tk=row.get('ticker','')
+            if str(row['txn_type']).upper()=='BUY':
+                q.append({"dt":dt,"qty":qty,"price":price})
+            elif str(row['txn_type']).upper()=='SELL':
+                rem=qty
+                while rem>1e-9 and q:
+                    lot=q[0]; mq=min(lot['qty'],rem)
+                    hd=(dt-lot['dt']).days if pd.notna(dt) and pd.notna(lot['dt']) else 0
+                    rr.append({"share_name":sn,"ticker":tk,"sell_date":dt,"buy_date":lot['dt'],
+                                "quantity":mq,"buy_price":lot['price'],"sell_price":price,
+                                "realized_pnl":(price-lot['price'])*mq,"holding_days":hd,
+                                "tax_term":"LTCG (>1yr)" if hd>365 else "STCG (<1yr)"})
+                    lot['qty']-=mq; rem-=mq
+                    if lot['qty']<=1e-9: q.pop(0)
+        for lot in q:
+            if lot['qty']>1e-9: ol.append({"share_name":sn,"buy_date":lot['dt'],"quantity":lot['qty'],"buy_price":lot['price']})
+    return pd.DataFrame(rr), pd.DataFrame(ol)
 
-def calculate_xirr(cashflows):
-    if len(cashflows) < 2: return None
-    dates = [c[0] for c in cashflows]; amounts = [c[1] for c in cashflows]; t0 = min(dates)
-    def xnpv(rate):
-        return sum(a/((1+rate)**((d-t0).days/365.0)) for d,a in zip(dates,amounts))
-    def xnpv_d(rate):
-        return sum(-((d-t0).days/365.0)*a/((1+rate)**(((d-t0).days/365.0)+1)) for d,a in zip(dates,amounts))
-    rate = 0.1
+def xirr(cfs):
+    if len(cfs)<2: return None
+    dates=[c[0] for c in cfs]; amts=[c[1] for c in cfs]; t0=min(dates)
+    def npv(r): return sum(a/((1+r)**((d-t0).days/365)) for d,a in zip(dates,amts))
+    def dnpv(r): return sum(-((d-t0).days/365)*a/((1+r)*(((d-t0).days/365)+1)) for d,a in zip(dates,amts))
+    rate=0.1
     for _ in range(100):
         try:
-            f,fp = xnpv(rate),xnpv_d(rate)
+            f,fp=npv(rate),dnpv(rate)
             if abs(fp)<1e-10: break
-            nr = rate-f/fp
+            nr=rate-f/fp
             if abs(nr-rate)<1e-7: rate=nr; break
-            rate = nr
+            rate=nr
         except: break
-    if rate<=-1 or rate>100:
-        lo,hi = -0.99,10.0
-        for _ in range(200):
-            mid=(lo+hi)/2
-            try: val=xnpv(mid)
-            except: val=float('inf')
-            if abs(val)<1e-3: return mid*100
-            if val>0: lo=mid
-            else: hi=mid
-        return None
+    if rate<=-1 or rate>100: return None
     return rate*100
 
 # ══════════════════════════════════════════════════════════════════════
-# SEARCH SUGGESTIONS
+# SCORECARD
 # ══════════════════════════════════════════════════════════════════════
-@st.cache_data(ttl=10, show_spinner=False)
-def fetch_search_suggestions(query):
-    if not query or len(query.strip())<2: return []
-    suggestions = []
-    try:
-        r = _requests.get("https://query2.finance.yahoo.com/v1/finance/search",
-            params={"q":query,"quotesCount":10,"newsCount":0},
-            headers={"User-Agent":"Mozilla/5.0"},timeout=4)
-        if r.status_code==200:
-            for q in r.json().get("quotes",[]):
-                if q.get("quoteType") not in ("EQUITY","ETF","MUTUALFUND",None): continue
-                suggestions.append({"label":f"{q.get('longname') or q.get('shortname') or q.get('symbol')}  —  {q.get('symbol')}  [{q.get('exchange','')}]",
-                    "ticker":q.get("symbol",""),"name":q.get("longname") or q.get("shortname") or q.get("symbol","")})
-    except Exception:
-        pass
-    if not suggestions:
-        try:
-            for q in (yf.Search(query,max_results=10).quotes or []):
-                suggestions.append({"label":f"{q.get('longname') or q.get('shortname') or q.get('symbol')}  —  {q.get('symbol')}",
-                    "ticker":q.get("symbol",""),"name":q.get("longname") or q.get("shortname") or q.get("symbol","")})
-        except Exception:
-            pass
-    return suggestions[:10]
+def scorecard(df_h, bench_ret=None):
+    n=len(df_h['share_name'].unique()); inv=df_h['Invested'].sum(); cur=df_h.get('Current',df_h['Invested']).sum()
+    pnl=(cur-inv); ret=(pnl/inv*100) if inv>0 else 0
+    wr=(df_h['PnL']>0).sum()/max(len(df_h),1)*100 if 'PnL' in df_h.columns else 0
+    mw=df_h['Weight'].max() if 'Weight' in df_h.columns else 0
+    vol=df_h['Returns_Pct'].std() if 'Returns_Pct' in df_h.columns else 1
+    avg_r=df_h['Returns_Pct'].mean() if 'Returns_Pct' in df_h.columns else 0
+    sharpe=(avg_r/vol) if vol and vol>0 else 0
+    mdd=((df_h.get('Simulated_Live',df_h.get('buy_price',0))-df_h.get('buy_price',0))/df_h.get('buy_price',pd.Series([1])).replace(0,1)*100).min() if 'buy_price' in df_h.columns else 0
+    alpha=(ret-bench_ret) if bench_ret is not None else None
+    sc=0
+    sc+=20 if n>=15 else (15 if n>=10 else (10 if n>=5 else 4))
+    sc+=min(20,int(wr/5))
+    sc+=20 if mw<10 else (14 if mw<20 else (8 if mw<30 else 2))
+    sc+=20 if ret>=20 else (15 if ret>=10 else (10 if ret>=0 else 2))
+    sc+=10 if sharpe>1 else (7 if sharpe>0.5 else (4 if sharpe>0 else 1))
+    sc+=10 if mdd>-10 else (6 if mdd>-20 else 2)
+    label=("Outstanding 🌟" if sc>=85 else "Excellent 💪" if sc>=70 else "Good 👍" if sc>=55 else "Moderate ⚠️" if sc>=40 else "Needs Work 🔴")
+    color=("#3fb950" if sc>=70 else "#e3b341" if sc>=45 else "#f85149")
+    return {"score":sc,"label":label,"color":color,"n":n,"wr":wr,"mw":mw,"ret":ret,"sharpe":sharpe,"alpha":alpha,"mdd":mdd,"vol":vol}
 
-@st.cache_data(ttl=60, show_spinner=False)
-def search_any_stock(query):
-    if not query or not query.strip(): return None
-    ticker = query.strip().upper() if _looks_like_ticker(query.strip()) else _search_yahoo_symbol(query.strip())
-    if not ticker: return None
-    try:
-        stock = yf.Ticker(ticker)
-        h1d = stock.history(period="1d"); h1y = stock.history(period="1y")
-        if h1d.empty: return None
-        try: cname = stock.info.get('longName') or stock.info.get('shortName') or ticker; curr = stock.info.get('currency','')
-        except: cname = ticker; curr = ''
-        return {"ticker":ticker,"company_name":cname,"currency":curr,"live_price":h1d['Close'].iloc[-1],
-                "high_52w":h1y['High'].max() if not h1y.empty else None,
-                "low_52w":h1y['Low'].min() if not h1y.empty else None,"history":h1y}
-    except Exception:
-        return None
+def cpnl(v):
+    if isinstance(v,str): return ''
+    return 'color:#3fb950;font-weight:bold;' if v>=0 else 'color:#f85149;font-weight:bold;'
 
 # ══════════════════════════════════════════════════════════════════════
-# ★ NEW: PORTFOLIO SCORECARD (detailed health metrics)
+# SESSION STATE
 # ══════════════════════════════════════════════════════════════════════
-def build_scorecard(df_h, benchmark_ret=None):
-    """Returns a dict of advanced portfolio metrics."""
-    n_stocks    = len(df_h['share_name'].unique())
-    total_inv   = df_h['Invested'].sum()
-    total_cur   = df_h['Current'].sum()
-    total_pnl   = df_h['PnL'].sum()
-    overall_ret = (total_pnl / total_inv * 100) if total_inv > 0 else 0
-    win_rate    = (df_h['PnL'] > 0).sum() / max(len(df_h),1) * 100
-    max_weight  = df_h['Weight'].max()
-    max_dd      = ((df_h['Simulated_Live'] - df_h['buy_price']) / df_h['buy_price'].replace(0,1) * 100).min()
-    avg_ret     = df_h['Returns_Pct'].mean()
-    vol         = df_h['Returns_Pct'].std()
-    sharpe      = (avg_ret / vol) if vol and vol > 0 else 0
-    alpha       = (overall_ret - benchmark_ret) if benchmark_ret is not None else None
+for k,v in [("alerted",set()),("overrides",None),("transactions",None),("mappings",None),
+            ("settings",None),("mf_list",None),("search_ticker",""),
+            ("ai_history",[]),("ai_portfolio_analysis","")]:
+    if k not in st.session_state: st.session_state[k]=v
 
-    # Scoring (100 pts total)
-    score = 0
-    score += 20 if n_stocks >= 15 else (15 if n_stocks >= 10 else (10 if n_stocks >= 5 else 4))
-    score += min(20, int(win_rate / 5))
-    score += 20 if max_weight < 10 else (14 if max_weight < 20 else (8 if max_weight < 30 else 2))
-    score += 20 if overall_ret >= 20 else (15 if overall_ret >= 10 else (10 if overall_ret >= 0 else 2))
-    score += 10 if sharpe > 1 else (7 if sharpe > 0.5 else (4 if sharpe > 0 else 1))
-    score += 10 if max_dd > -10 else (6 if max_dd > -20 else 2)
+if st.session_state.overrides   is None: st.session_state.overrides   = load_overrides()
+if st.session_state.transactions is None: st.session_state.transactions = load_transactions()
+if st.session_state.mappings    is None: st.session_state.mappings    = load_mappings()
+if st.session_state.settings    is None: st.session_state.settings    = load_settings()
+if st.session_state.mf_list     is None: st.session_state.mf_list     = load_mf_list()
 
-    label = ("Outstanding 🌟" if score >= 85 else "Excellent 💪" if score >= 70 else
-             "Good 👍" if score >= 55 else "Moderate ⚠️" if score >= 40 else "Needs Work 🔴")
-    color = ("#3fb950" if score >= 70 else "#e3b341" if score >= 45 else "#f85149")
-    return {"score":score,"label":label,"color":color,"n_stocks":n_stocks,
-            "win_rate":win_rate,"max_weight":max_weight,"overall_ret":overall_ret,
-            "sharpe":sharpe,"alpha":alpha,"max_dd":max_dd,"volatility":vol}
-
-def color_pnl(val):
-    if isinstance(val, str): return ''
-    return 'color:#3fb950;font-weight:bold;' if val>=0 else 'color:#f85149;font-weight:bold;'
+_cfg = st.session_state.settings
 
 # ══════════════════════════════════════════════════════════════════════
-# SESSION STATE INIT
+# MARKET BAR
 # ══════════════════════════════════════════════════════════════════════
-if "alerted_keys"            not in st.session_state: st.session_state.alerted_keys = set()
-if "manual_ticker_overrides" not in st.session_state: st.session_state.manual_ticker_overrides = load_overrides()
-if "transactions_df"         not in st.session_state: st.session_state.transactions_df = load_transactions()
-if "saved_mappings"          not in st.session_state: st.session_state.saved_mappings = load_mappings()
-if "app_settings"            not in st.session_state: st.session_state.app_settings = load_settings()
-if "search_selected_ticker"  not in st.session_state: st.session_state.search_selected_ticker = ""
-if "search_last_query"       not in st.session_state: st.session_state.search_last_query = ""
-
-_s = st.session_state.app_settings  # shorthand
-
-# ══════════════════════════════════════════════════════════════════════
-# ★ MARKET OVERVIEW BAR (top of every page)
-# ══════════════════════════════════════════════════════════════════════
-indices_data = fetch_market_indices()
-if indices_data:
-    parts = []
-    for name,(val,chg) in indices_data.items():
-        chg_cls = "market-chg-pos" if chg>=0 else "market-chg-neg"
-        sign    = "▲" if chg>=0 else "▼"
-        is_gold = "GOLD" in name
-        val_str = f"${val:,.2f}" if is_gold else f"{val:,.2f}"
-        parts.append(f"""<div class="market-item">
-            <span class="market-name">{name}</span>
-            <span class="market-val">{val_str}</span>
-            <span class="{chg_cls}">{sign} {abs(chg):.2f}%</span>
-        </div>""")
-    ts = now_ist().strftime("%H:%M:%S IST")
-    st.markdown(
-        f'<div class="market-bar">{"".join(parts)}'
-        f'<div class="market-item" style="margin-left:auto;"><span class="market-name">Last Updated</span>'
-        f'<span class="market-val" style="font-size:12px;">{ts}</span></div></div>',
-        unsafe_allow_html=True)
+idx_data = fetch_indices()
+if idx_data:
+    parts=[]
+    for n,(v,c) in idx_data.items():
+        cc="mcg" if c>=0 else "mcr"; sg="▲" if c>=0 else "▼"
+        vs=f"${v:,.2f}" if n=="GOLD" else f"{v:,.2f}"
+        parts.append(f'<div class="mi"><span class="mn">{n}</span><span class="mv2">{vs}</span><span class="{cc}">{sg}{abs(c):.2f}%</span></div>')
+    ts=now_ist().strftime("%H:%M:%S IST")
+    st.markdown(f'<div class="mbar">{"".join(parts)}<div class="mi" style="margin-left:auto;"><span class="mn">Updated</span><span class="mv2" style="font-size:12px;">{ts}</span></div></div>', unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════════
 # SIDEBAR
 # ══════════════════════════════════════════════════════════════════════
 with st.sidebar:
     st.markdown("<h2 style='color:#58a6ff;text-align:center;font-family:monospace;letter-spacing:2px;'>ALPHA TERMINAL</h2>", unsafe_allow_html=True)
+    st.caption("v6.0 Pro+  •  AI-Powered")
     st.markdown("---")
-    menu = st.radio("⚡ Terminal Monitor", [
+    menu = st.radio("⚡ Navigation", [
         "🖥️ Overview Dashboard",
+        "🤖 AI Portfolio Advisor",
+        "📊 Technical Indicators",
+        "⛓️ Options Chain",
+        "💰 Mutual Fund Tracker",
         "📈 Advanced Analysis",
         "🔍 Single Stock Matrix",
         "🔎 Search Any Stock",
-        "💼 Transaction Ledger (Buy/Sell)",
         "📰 Market News Feed",
+        "💼 Transaction Ledger",
         "⚙️ Settings & Alerts",
     ])
     st.markdown("---")
-
-    st.markdown("### 🔍 Quick Filter")
-    stock_filter = st.selectbox("Filter:", ["All Holdings","🟢 Profit Only","🔴 Loss Only"])
+    st.markdown("### 🔍 Filter")
+    stock_filter = st.selectbox("Holdings:", ["All Holdings","🟢 Profit Only","🔴 Loss Only"])
     st.markdown("---")
-
-    st.markdown("### 🎯 Risk Management")
-    target_pct    = st.slider("Take Profit (%)",  5, 100,  20, 5)
-    stop_loss_pct = st.slider("Stop Loss (%)",   -50,  -5, -10, 5)
+    st.markdown("### 🎯 Risk Levels")
+    target_pct    = st.slider("Take Profit %",  5, 100, 20, 5)
+    stop_loss_pct = st.slider("Stop Loss %",   -50,  -5,-10, 5)
+    market_shock  = st.slider("Stress Test %", -50,  50,  0, 5)
     st.markdown("---")
-
-    st.markdown("### 📉 Market Stress Test")
-    market_shock  = st.slider("Simulate crash/rally (%)", -50, 50, 0, 5)
-    st.markdown("---")
-
-    st.markdown("### 🛠️ Ticker Overrides")
-    if st.session_state.manual_ticker_overrides:
-        st.caption(f"✅ {len(st.session_state.manual_ticker_overrides)} override(s) saved.")
-        with st.expander("View / Delete"):
-            for k,v in list(st.session_state.manual_ticker_overrides.items()):
-                c1,c2 = st.columns([3,1])
-                c1.write(f"**{k[:25]}** → `{v}`")
-                if c2.button("❌", key=f"del_{k}"):
-                    st.session_state.manual_ticker_overrides.pop(k, None)
-                    save_overrides(st.session_state.manual_ticker_overrides)
+    if st.session_state.overrides:
+        st.caption(f"🛠️ {len(st.session_state.overrides)} ticker override(s)")
+        with st.expander("Manage overrides"):
+            for k,v in list(st.session_state.overrides.items()):
+                c1,c2=st.columns([4,1]); c1.caption(f"**{k[:22]}** → `{v}`")
+                if c2.button("✕",key=f"do_{k}"):
+                    st.session_state.overrides.pop(k,None)
+                    save_overrides(st.session_state.overrides)
                     st.cache_data.clear(); st.rerun()
-    else:
-        st.caption("No overrides saved yet.")
 
 # ══════════════════════════════════════════════════════════════════════
-# HEADER + FILE UPLOAD
+# MAIN HEADER + FILE UPLOAD
 # ══════════════════════════════════════════════════════════════════════
-st.markdown("<h2 style='color:#e6edf3;'>📊 AlphaPortfolio Intelligence Terminal <span style='font-size:14px;color:#58a6ff;'>v5.0 Pro+</span></h2>", unsafe_allow_html=True)
-uploaded_file = st.file_uploader("Drag and drop your holdings file (CSV or Excel)", type=['csv','xlsx'])
-
+st.markdown("<h2 style='color:#e6edf3;'>📊 AlphaPortfolio Intelligence Terminal <span style='font-size:13px;color:#58a6ff;'>v6.0 Pro+ | AI-Powered</span></h2>", unsafe_allow_html=True)
+uploaded_file = st.file_uploader("Upload your holdings file (CSV or Excel)", type=['csv','xlsx'])
 df = pd.DataFrame()
-if uploaded_file is not None:
+if uploaded_file:
     try:
         df = pd.read_excel(uploaded_file) if uploaded_file.name.endswith('.xlsx') else pd.read_csv(uploaded_file)
-    except Exception as e:
-        st.error(f"⚠️ File Error: {e}")
+    except Exception as e: st.error(f"File Error: {e}")
 
 # ══════════════════════════════════════════════════════════════════════
-# ★ SETTINGS & ALERTS PAGE
+# AI PORTFOLIO ADVISOR
 # ══════════════════════════════════════════════════════════════════════
-if "Settings" in menu or "⚙️" in menu:
-    st.markdown("<h3>⚙️ Settings & Alert Configuration</h3>", unsafe_allow_html=True)
-    set_tab1, set_tab2, set_tab3 = st.tabs(["📧 Email Alerts","📱 Telegram Alerts","🎯 Price Alerts"])
+if "AI" in menu or "🤖" in menu:
+    st.markdown("<h3>🤖 AI Portfolio Advisor</h3>", unsafe_allow_html=True)
+    st.caption("Free rule-based investment advisor — analyzes your actual holdings data using financial rules (concentration, sector exposure, tax timing, momentum). No API key needed.")
 
-    with set_tab1:
-        st.markdown("#### Gmail Email Alerts")
-        st.caption("You need a Gmail **App Password** (not your normal password). Generate at myaccount.google.com → Security → App Passwords.")
-        em_en  = st.checkbox("Enable Email Alerts", value=_s.get("email_enabled", False))
-        em_sndr= st.text_input("Sender Gmail", value=_s.get("email_sender",""), placeholder="you@gmail.com")
-        em_pwd = st.text_input("Gmail App Password", value=_s.get("email_password",""), type="password")
-        em_rcpt= st.text_input("Recipient Email", value=_s.get("email_recipient",""), placeholder="you@gmail.com")
-        if st.button("💾 Save Email Settings", use_container_width=True):
-            _s.update({"email_enabled":em_en,"email_sender":em_sndr,"email_password":em_pwd,"email_recipient":em_rcpt})
-            save_settings(_s); st.session_state.app_settings = _s
-            st.success("✅ Email settings saved!")
-        if st.button("🧪 Send Test Email", use_container_width=True):
-            ok,msg = send_email_alert(em_sndr, em_pwd, em_rcpt or em_sndr, "AlphaPortfolio Test", "✅ Email alerts are working correctly!")
-            st.success("Test email sent!") if ok else st.error(f"Failed: {msg}")
+    # Build portfolio context if file uploaded and processed
+    port_ctx = build_portfolio_context(df if not df.empty else None)
 
-    with set_tab2:
-        st.markdown("#### Telegram Bot Alerts")
-        st.caption("Create a bot via [@BotFather](https://t.me/BotFather) → get token. Then message your bot once, and get your Chat ID from [@userinfobot](https://t.me/userinfobot).")
-        tg_en  = st.checkbox("Enable Telegram Alerts", value=_s.get("telegram_enabled", False))
-        tg_tok = st.text_input("Bot Token", value=_s.get("telegram_token",""), placeholder="123456:ABC-DEF...")
-        tg_cid = st.text_input("Chat ID", value=_s.get("telegram_chat_id",""), placeholder="123456789")
-        if st.button("💾 Save Telegram Settings", use_container_width=True):
-            _s.update({"telegram_enabled":tg_en,"telegram_token":tg_tok,"telegram_chat_id":tg_cid})
-            save_settings(_s); st.session_state.app_settings = _s
-            st.success("✅ Telegram settings saved!")
-        if st.button("🧪 Send Test Telegram Message", use_container_width=True):
-            ok,msg = send_telegram_alert(tg_tok, tg_cid, "✅ <b>AlphaPortfolio</b> Telegram alerts are working!")
-            st.success("Test message sent!") if ok else st.error(f"Failed: {msg}")
+    ai_tab1, ai_tab2 = st.tabs(["📋 Auto Portfolio Analysis", "💬 Chat with AI"])
 
-    with set_tab3:
-        st.markdown("#### 🎯 Price Target & Stop-Loss Alerts")
-        st.caption("Set a target price (alert when stock hits or crosses above) and/or a stop price (alert when it drops to or below). Alerts fire once per session.")
-        existing_alerts = load_price_alerts()
-        with st.form("price_alert_form", clear_on_submit=True):
-            pa1,pa2,pa3,pa4 = st.columns(4)
-            with pa1: pa_ticker = st.text_input("Yahoo Ticker", placeholder="e.g. RELIANCE.NS")
-            with pa2: pa_name   = st.text_input("Label (optional)", placeholder="e.g. Reliance")
-            with pa3: pa_target = st.number_input("Target Price ₹", min_value=0.0, step=1.0, format="%.2f")
-            with pa4: pa_stop   = st.number_input("Stop Price ₹",   min_value=0.0, step=1.0, format="%.2f")
-            if st.form_submit_button("➕ Add Alert", use_container_width=True):
-                if pa_ticker.strip():
-                    existing_alerts[pa_ticker.strip().upper()] = {
-                        "name": pa_name.strip() or pa_ticker.strip().upper(),
-                        "target": pa_target if pa_target > 0 else None,
-                        "stop":   pa_stop   if pa_stop   > 0 else None,
+    with ai_tab1:
+        st.markdown("#### 📋 Instant AI Analysis of Your Portfolio")
+        if df.empty:
+            st.info("💡 Upload your portfolio file above to get an instant AI analysis of your holdings, risks, and rebalancing suggestions.")
+        else:
+            col_a1, col_a2 = st.columns([3,1])
+            with col_a1:
+                analysis_type = st.selectbox("Analysis type:", [
+                    "🔍 Complete Portfolio Health Check",
+                    "⚠️ Risk Assessment & Concentration Analysis",
+                    "📈 Rebalancing Suggestions",
+                    "💡 Buy/Sell Recommendations based on Holdings",
+                    "🧾 Tax Optimization Strategy (STCG vs LTCG)",
+                    "📊 Sector Diversification Review",
+                ])
+            with col_a2:
+                st.markdown("<br>", unsafe_allow_html=True)
+                run_analysis = st.button("🚀 Run Analysis", use_container_width=True, type="primary")
+
+            if run_analysis or st.session_state.ai_portfolio_analysis:
+                if run_analysis:
+                    type_map = {
+                        "🔍 Complete Portfolio Health Check": "health",
+                        "⚠️ Risk Assessment & Concentration Analysis": "risk",
+                        "📈 Rebalancing Suggestions": "rebalance",
+                        "💡 Buy/Sell Recommendations based on Holdings": "buysell",
+                        "🧾 Tax Optimization Strategy (STCG vs LTCG)": "tax",
+                        "📊 Sector Diversification Review": "sector",
                     }
-                    save_price_alerts(existing_alerts)
-                    st.success(f"✅ Alert added for {pa_ticker.strip().upper()}")
-                    st.rerun()
+                    with st.spinner("🤖 Analyzing your portfolio..."):
+                        result = rule_based_advisor(df, type_map.get(analysis_type, "health"))
+                    st.session_state.ai_portfolio_analysis = result
+                if st.session_state.ai_portfolio_analysis:
+                    st.markdown(f'<div class="ai-msg">{st.session_state.ai_portfolio_analysis}</div>', unsafe_allow_html=True)
+                    st.download_button("📥 Download Analysis", data=st.session_state.ai_portfolio_analysis.encode(),
+                                       file_name="ai_portfolio_analysis.txt", mime="text/plain", use_container_width=True)
+                    if st.button("🔄 Clear & Re-analyze", use_container_width=True):
+                        st.session_state.ai_portfolio_analysis = ""; st.rerun()
 
-        if existing_alerts:
-            st.markdown("**Current Price Alerts:**")
-            for tk, al in existing_alerts.items():
-                ac1,ac2,ac3,ac4 = st.columns([2,2,2,1])
-                ac1.write(f"**{tk}** ({al.get('name','')})")
-                ac2.write(f"🎯 Target: ₹{al['target']:,.2f}" if al.get('target') else "🎯 Target: —")
-                ac3.write(f"🛑 Stop: ₹{al['stop']:,.2f}"   if al.get('stop')   else "🛑 Stop: —")
-                if ac4.button("🗑️", key=f"del_al_{tk}"):
-                    existing_alerts.pop(tk, None)
-                    save_price_alerts(existing_alerts); st.rerun()
+    with ai_tab2:
+        st.markdown("#### 💬 Ask About Your Portfolio")
+        st.caption("Ask about risk, rebalancing, tax, sectors, or specific stocks — answers come from your actual holdings data using built-in financial rules (free, no API key).")
+
+        # Chat history display
+        for msg in st.session_state.ai_history:
+            if msg["role"] == "user":
+                st.markdown(f'<div class="ai-user">👤 <b>You:</b> {msg["content"]}</div>', unsafe_allow_html=True)
+            else:
+                st.markdown(f'<div class="ai-msg">🤖 <b>Advisor:</b> {msg["content"]}</div>', unsafe_allow_html=True)
+
+        # Quick prompt chips
+        st.markdown("**Quick prompts:**")
+        qp_cols = st.columns(4)
+        quick_prompts = [
+            "Which of my stocks should I consider selling?",
+            "How can I reduce my tax liability?",
+            "What are defensive stocks?",
+            "Explain RSI and when to use it",
+        ]
+        triggered_prompt = None
+        for i, qp in enumerate(quick_prompts):
+            if qp_cols[i].button(qp[:30]+"…", key=f"qp_{i}", use_container_width=True):
+                triggered_prompt = qp
+
+        with st.form("ai_chat_form", clear_on_submit=True):
+            user_input = st.text_area("Your question:", placeholder="e.g. Is my portfolio too concentrated in one sector?", height=80, label_visibility="collapsed")
+            send_btn = st.form_submit_button("Send ➤", use_container_width=True)
+
+        final_input = triggered_prompt or (user_input.strip() if send_btn and user_input.strip() else None)
+
+        if final_input:
+            with st.spinner("🤖 Analyzing..."):
+                reply = rule_based_advisor(df if not df.empty else None, "qa", final_input)
+            st.session_state.ai_history.append({"role":"user","content":final_input})
+            st.session_state.ai_history.append({"role":"assistant","content":reply})
+            if len(st.session_state.ai_history) > 20:
+                st.session_state.ai_history = st.session_state.ai_history[-20:]
+            st.rerun()
+
+        if st.session_state.ai_history:
+            if st.button("🗑️ Clear Chat", use_container_width=True):
+                st.session_state.ai_history = []; st.rerun()
+
+# ══════════════════════════════════════════════════════════════════════
+# TECHNICAL INDICATORS
+# ══════════════════════════════════════════════════════════════════════
+elif "Technical" in menu or "📊" in menu:
+    st.markdown("<h3>📊 Technical Analysis — RSI, MACD, Bollinger Bands, Moving Averages</h3>", unsafe_allow_html=True)
+
+    ti_query = st.text_input("Enter ticker (e.g. RELIANCE.NS, TCS.NS, AAPL):", placeholder="RELIANCE.NS")
+    ti_period = st.select_slider("Chart period:", options=["1mo","3mo","6mo","1y","2y"], value="6mo")
+
+    if ti_query.strip():
+        tk_ti = ti_query.strip().upper()
+        with st.spinner(f"Fetching data for {tk_ti}..."):
+            ti_df = fetch_technicals(tk_ti, ti_period)
+
+        if ti_df is None:
+            st.error(f"⚠️ Could not fetch data for {tk_ti}. Check the ticker and try again.")
         else:
-            st.info("No price alerts set yet.")
+            last = ti_df.iloc[-1]
+            signals = get_technical_signal(ti_df)
+
+            # Signal summary row
+            st.markdown("#### ⚡ Signal Summary")
+            sig_cols = st.columns(len(signals))
+            for i,(ind,sig,col) in enumerate(signals):
+                sig_cols[i].markdown(f'<div class="tc"><div class="mt">{ind}</div><div class="mv" style="font-size:14px;color:{col};">{sig}</div></div>', unsafe_allow_html=True)
+
+            # KPI row
+            kc1,kc2,kc3,kc4,kc5 = st.columns(5)
+            kc1.markdown(f'<div class="tc"><div class="mt">LAST CLOSE</div><div class="mv">₹{last["Close"]:,.2f}</div></div>', unsafe_allow_html=True)
+            kc2.markdown(f'<div class="tc"><div class="mt">RSI (14)</div><div class="mv" style="color:{"#f85149" if last["RSI"]>70 else "#3fb950" if last["RSI"]<30 else "#e6edf3"};">{last["RSI"]:.1f}</div></div>', unsafe_allow_html=True)
+            kc3.markdown(f'<div class="tc"><div class="mt">MACD</div><div class="mv" style="color:{"#3fb950" if last["MACD"]>last["MACD_Signal"] else "#f85149"};">{last["MACD"]:.2f}</div></div>', unsafe_allow_html=True)
+            kc4.markdown(f'<div class="tc"><div class="mt">MA 20</div><div class="mv">₹{last["MA20"]:,.2f}</div></div>', unsafe_allow_html=True)
+            kc5.markdown(f'<div class="tc"><div class="mt">MA 50</div><div class="mv">₹{last["MA50"]:,.2f}</div></div>', unsafe_allow_html=True)
+
+            # Chart 1: Price + Bollinger + MAs
+            st.markdown("---")
+            fig1 = go.Figure()
+            fig1.add_trace(go.Candlestick(x=ti_df.index,open=ti_df['Open'],high=ti_df['High'],low=ti_df['Low'],close=ti_df['Close'],name='Price',increasing_line_color='#3fb950',decreasing_line_color='#f85149'))
+            fig1.add_trace(go.Scatter(x=ti_df.index,y=ti_df['BB_Upper'],name='BB Upper',line=dict(color='#e3b341',width=1,dash='dot')))
+            fig1.add_trace(go.Scatter(x=ti_df.index,y=ti_df['BB_Mid'],name='BB Mid (MA20)',line=dict(color='#8b949e',width=1)))
+            fig1.add_trace(go.Scatter(x=ti_df.index,y=ti_df['BB_Lower'],name='BB Lower',line=dict(color='#e3b341',width=1,dash='dot'),fill='tonexty',fillcolor='rgba(227,179,65,0.05)'))
+            if not ti_df['MA50'].isna().all():
+                fig1.add_trace(go.Scatter(x=ti_df.index,y=ti_df['MA50'],name='MA 50',line=dict(color='#58a6ff',width=1.5)))
+            if not ti_df['MA200'].isna().all():
+                fig1.add_trace(go.Scatter(x=ti_df.index,y=ti_df['MA200'],name='MA 200',line=dict(color='#f85149',width=1.5)))
+            fig1.update_layout(plot_bgcolor='#161b22',paper_bgcolor='#0d1117',font=dict(color='#8b949e'),margin=dict(l=10,r=10,t=30,b=10),title=f"{tk_ti} — Price + Bollinger Bands + Moving Averages",xaxis_rangeslider_visible=False,xaxis=dict(gridcolor='#21262d'),yaxis=dict(gridcolor='#21262d'),legend=dict(orientation="h",y=-0.15))
+            st.plotly_chart(fig1, use_container_width=True)
+
+            # Chart 2: RSI
+            fig_rsi = go.Figure()
+            fig_rsi.add_trace(go.Scatter(x=ti_df.index,y=ti_df['RSI'],name='RSI',line=dict(color='#58a6ff',width=2)))
+            fig_rsi.add_hline(y=70,line_dash="dash",line_color="#f85149",annotation_text="Overbought (70)")
+            fig_rsi.add_hline(y=30,line_dash="dash",line_color="#3fb950",annotation_text="Oversold (30)")
+            fig_rsi.add_hrect(y0=30,y1=70,fillcolor="rgba(88,166,255,0.04)",line_width=0)
+            fig_rsi.update_layout(plot_bgcolor='#161b22',paper_bgcolor='#0d1117',font=dict(color='#8b949e'),margin=dict(l=10,r=10,t=30,b=10),title="RSI (14-day)",yaxis=dict(range=[0,100],gridcolor='#21262d'),xaxis=dict(gridcolor='#21262d'),showlegend=False)
+            st.plotly_chart(fig_rsi, use_container_width=True)
+
+            # Chart 3: MACD
+            colors_hist = ['#3fb950' if v>=0 else '#f85149' for v in ti_df['MACD_Hist']]
+            fig_macd = go.Figure()
+            fig_macd.add_trace(go.Bar(x=ti_df.index,y=ti_df['MACD_Hist'],name='MACD Histogram',marker_color=colors_hist))
+            fig_macd.add_trace(go.Scatter(x=ti_df.index,y=ti_df['MACD'],name='MACD',line=dict(color='#58a6ff',width=2)))
+            fig_macd.add_trace(go.Scatter(x=ti_df.index,y=ti_df['MACD_Signal'],name='Signal',line=dict(color='#e3b341',width=1.5,dash='dot')))
+            fig_macd.add_hline(y=0,line_color="#30363d")
+            fig_macd.update_layout(plot_bgcolor='#161b22',paper_bgcolor='#0d1117',font=dict(color='#8b949e'),margin=dict(l=10,r=10,t=30,b=10),title="MACD (12, 26, 9)",xaxis=dict(gridcolor='#21262d'),yaxis=dict(gridcolor='#21262d'),legend=dict(orientation="h",y=-0.2))
+            st.plotly_chart(fig_macd, use_container_width=True)
+
+            # Chart 4: Volume
+            vol_colors = ['#3fb950' if ti_df['Close'].iloc[i]>=ti_df['Open'].iloc[i] else '#f85149' for i in range(len(ti_df))]
+            fig_vol = go.Figure()
+            fig_vol.add_trace(go.Bar(x=ti_df.index,y=ti_df['Volume'],name='Volume',marker_color=vol_colors,opacity=0.7))
+            fig_vol.add_trace(go.Scatter(x=ti_df.index,y=ti_df['Vol_MA20'],name='Vol MA20',line=dict(color='#e3b341',width=1.5)))
+            fig_vol.update_layout(plot_bgcolor='#161b22',paper_bgcolor='#0d1117',font=dict(color='#8b949e'),margin=dict(l=10,r=10,t=30,b=10),title="Volume",xaxis=dict(gridcolor='#21262d'),yaxis=dict(gridcolor='#21262d'),legend=dict(orientation="h",y=-0.2))
+            st.plotly_chart(fig_vol, use_container_width=True)
+    else:
+        st.info("💡 Enter a ticker above to see RSI, MACD, Bollinger Bands, and Moving Averages charts.")
 
 # ══════════════════════════════════════════════════════════════════════
-# ★ NEWS FEED PAGE
+# OPTIONS CHAIN
 # ══════════════════════════════════════════════════════════════════════
-elif "News Feed" in menu or "📰" in menu:
+elif "Options" in menu or "⛓️" in menu:
+    st.markdown("<h3>⛓️ Options Chain Viewer</h3>", unsafe_allow_html=True)
+    st.caption("Live F&O data — Calls & Puts with Strike, Last Price, Bid, Ask, Volume, Open Interest, and Implied Volatility.")
+
+    oc_query = st.text_input("Enter ticker:", placeholder="RELIANCE.NS, TCS.NS, NIFTY (use ^NSEI for Nifty index)")
+    if oc_query.strip():
+        tk_oc = oc_query.strip().upper()
+        with st.spinner(f"Fetching options chain for {tk_oc}..."):
+            calls, puts, exp_dates = fetch_options(tk_oc)
+
+        if calls is None or calls.empty:
+            st.error(f"⚠️ Options data not available for {tk_oc}. Note: F&O data requires a valid options-eligible ticker (e.g. RELIANCE.NS, NIFTY50=F.NS). Try AAPL or SPY for US options.")
+        else:
+            # Expiry selector
+            if len(exp_dates) > 1:
+                sel_exp = st.selectbox("Select Expiry Date:", exp_dates)
+                if sel_exp != exp_dates[0]:
+                    with st.spinner("Loading..."):
+                        try:
+                            chain2 = yf.Ticker(tk_oc).option_chain(sel_exp)
+                            calls = chain2.calls[['strike','lastPrice','bid','ask','volume','openInterest','impliedVolatility']].copy()
+                            puts  = chain2.puts[['strike','lastPrice','bid','ask','volume','openInterest','impliedVolatility']].copy()
+                            calls.columns = puts.columns = ['Strike','Last','Bid','Ask','Volume','OI','IV']
+                            calls['IV'] = (calls['IV']*100).round(2)
+                            puts['IV']  = (puts['IV']*100).round(2)
+                        except: pass
+            else:
+                st.caption(f"Expiry: **{exp_dates[0]}**")
+
+            # Summary metrics
+            oc1,oc2,oc3,oc4 = st.columns(4)
+            total_call_oi = calls['OI'].sum(); total_put_oi = puts['OI'].sum()
+            pcr = total_put_oi/total_call_oi if total_call_oi>0 else 0
+            oc1.markdown(f'<div class="tc"><div class="mt">TOTAL CALL OI</div><div class="mv">{int(total_call_oi):,}</div></div>', unsafe_allow_html=True)
+            oc2.markdown(f'<div class="tc"><div class="mt">TOTAL PUT OI</div><div class="mv">{int(total_put_oi):,}</div></div>', unsafe_allow_html=True)
+            pcr_color = "#3fb950" if pcr < 0.7 else ("#e3b341" if pcr < 1.2 else "#f85149")
+            oc3.markdown(f'<div class="tc"><div class="mt">PUT/CALL RATIO</div><div class="mv" style="color:{pcr_color};">{pcr:.2f}</div><div class="mb">{"Bullish" if pcr<0.7 else "Neutral" if pcr<1.2 else "Bearish"}</div></div>', unsafe_allow_html=True)
+            max_pain_strike = calls.loc[calls['OI'].idxmax(),'Strike'] if not calls.empty else 0
+            oc4.markdown(f'<div class="tc"><div class="mt">MAX PAIN (CALL OI)</div><div class="mv">₹{max_pain_strike:,.0f}</div></div>', unsafe_allow_html=True)
+
+            st.markdown("---")
+            opt_tab1, opt_tab2, opt_tab3 = st.tabs(["📞 Calls","📉 Puts","📈 OI Chart"])
+            with opt_tab1:
+                st.dataframe(calls.style.format({"Strike":"₹{:,.2f}","Last":"₹{:,.2f}","Bid":"₹{:,.2f}","Ask":"₹{:,.2f}","Volume":"{:,.0f}","OI":"{:,.0f}","IV":"{:.1f}%"}).background_gradient(subset=['OI'],cmap='Greens'),use_container_width=True,height=400)
+            with opt_tab2:
+                st.dataframe(puts.style.format({"Strike":"₹{:,.2f}","Last":"₹{:,.2f}","Bid":"₹{:,.2f}","Ask":"₹{:,.2f}","Volume":"{:,.0f}","OI":"{:,.0f}","IV":"{:.1f}%"}).background_gradient(subset=['OI'],cmap='Reds'),use_container_width=True,height=400)
+            with opt_tab3:
+                fig_oi = go.Figure()
+                fig_oi.add_trace(go.Bar(x=calls['Strike'],y=calls['OI'],name='Call OI',marker_color='#3fb950',opacity=0.8))
+                fig_oi.add_trace(go.Bar(x=puts['Strike'],y=puts['OI'],name='Put OI',marker_color='#f85149',opacity=0.8))
+                fig_oi.update_layout(barmode='group',plot_bgcolor='#161b22',paper_bgcolor='#0d1117',font=dict(color='#8b949e'),margin=dict(l=10,r=10,t=30,b=10),title="Open Interest by Strike",xaxis=dict(gridcolor='#21262d',title='Strike Price'),yaxis=dict(gridcolor='#21262d',title='Open Interest'),legend=dict(orientation="h",y=-0.2))
+                st.plotly_chart(fig_oi, use_container_width=True)
+    else:
+        st.info("💡 Enter a ticker above to see its live options chain data.")
+
+# ══════════════════════════════════════════════════════════════════════
+# MUTUAL FUND TRACKER
+# ══════════════════════════════════════════════════════════════════════
+elif "Mutual Fund" in menu or "💰" in menu:
+    st.markdown("<h3>💰 Mutual Fund Tracker</h3>", unsafe_allow_html=True)
+    st.caption("NAV data via AMFI India API (free, no auth needed). Search by fund name and add to your watchlist.")
+
+    mf_tab1, mf_tab2 = st.tabs(["🔍 Search & Add Funds","📋 My MF Watchlist"])
+
+    with mf_tab1:
+        mf_query = st.text_input("Search fund name:", placeholder="e.g. Mirae Asset, SBI Blue Chip, HDFC Top 100")
+        if mf_query.strip():
+            with st.spinner("Searching..."):
+                results = search_mf(mf_query.strip())
+            if results:
+                for fund in results[:15]:
+                    fc1,fc2,fc3 = st.columns([5,2,1])
+                    fc1.write(f"**{fund.get('schemeName','')[:60]}**")
+                    fc2.caption(f"Code: {fund.get('schemeCode','')}")
+                    if fc3.button("➕ Add", key=f"add_mf_{fund.get('schemeCode','')}"):
+                        current = st.session_state.mf_list or []
+                        entry = {"code":str(fund['schemeCode']),"name":fund.get('schemeName',''),"units":0,"avg_nav":0}
+                        if not any(x['code']==entry['code'] for x in current):
+                            current.append(entry)
+                            st.session_state.mf_list = current
+                            save_mf_list(current)
+                            st.success(f"Added: {entry['name'][:40]}"); st.rerun()
+                        else:
+                            st.info("Already in watchlist.")
+            else:
+                st.info("No results. Try a broader search term.")
+
+    with mf_tab2:
+        mf_list = st.session_state.mf_list or []
+        if not mf_list:
+            st.info("💡 No funds in watchlist yet. Search and add funds in the '🔍 Search' tab.")
+        else:
+            # Edit units/avg_nav for P&L calculation
+            with st.expander("✏️ Set your Units & Average NAV (for P&L calculation)"):
+                for i,fund in enumerate(mf_list):
+                    ec1,ec2,ec3,ec4 = st.columns([3,1.5,1.5,0.8])
+                    ec1.caption(fund['name'][:45])
+                    new_units = ec2.number_input("Units",value=float(fund.get('units',0)),min_value=0.0,step=0.01,key=f"mu_{i}",label_visibility="collapsed")
+                    new_nav   = ec3.number_input("Avg NAV ₹",value=float(fund.get('avg_nav',0)),min_value=0.0,step=0.01,key=f"mn_{i}",label_visibility="collapsed")
+                    mf_list[i]['units'] = new_units; mf_list[i]['avg_nav'] = new_nav
+                    if ec4.button("🗑️",key=f"rm_{i}"):
+                        mf_list.pop(i); st.session_state.mf_list=mf_list; save_mf_list(mf_list); st.rerun()
+                if st.button("💾 Save Units & NAV",use_container_width=True):
+                    st.session_state.mf_list=mf_list; save_mf_list(mf_list); st.success("Saved!")
+
+            # Fetch live NAV for all watchlist funds
+            st.markdown("---")
+            st.markdown("#### 📊 Live NAV & Performance")
+            mf_rows=[]
+            for fund in mf_list:
+                with st.spinner(f"Loading {fund['name'][:30]}..."):
+                    nav_data = fetch_mf_nav(fund['code'])
+                if nav_data:
+                    units = float(fund.get('units',0)); avg_n = float(fund.get('avg_nav',0))
+                    curr_val = units * nav_data['nav']
+                    inv_val  = units * avg_n
+                    pnl      = curr_val - inv_val if units>0 and avg_n>0 else None
+                    pnl_pct  = (pnl/inv_val*100) if (pnl is not None and inv_val>0) else None
+                    mf_rows.append({"Fund Name":nav_data['scheme_name'][:50],"Fund House":nav_data['fund_house'][:25],"Type":nav_data['scheme_type'][:20],
+                                    "Current NAV":nav_data['nav'],"NAV Date":nav_data['nav_date'],
+                                    "1M Ret%":nav_data['1m_return'],"3M Ret%":nav_data['3m_return'],"1Y Ret%":nav_data['1y_return'],
+                                    "Your Units":units,"Avg NAV":avg_n,"Current Val":curr_val if units>0 else None,
+                                    "P&L":pnl,"P&L%":pnl_pct})
+                    # Mini chart
+                    if not nav_data['history'].empty:
+                        fig_mf = go.Figure(go.Scatter(x=nav_data['history']['date'],y=nav_data['history']['nav'],line=dict(color='#58a6ff',width=2),fill='tozeroy',fillcolor='rgba(88,166,255,0.06)'))
+                        fig_mf.update_layout(plot_bgcolor='#161b22',paper_bgcolor='#0d1117',font=dict(color='#8b949e'),margin=dict(l=10,r=10,t=30,b=10),title=dict(text=f"{nav_data['scheme_name'][:40]} — 1Y NAV",font=dict(color='#e6edf3',size=12)),height=200,xaxis=dict(gridcolor='#21262d'),yaxis=dict(gridcolor='#21262d'))
+                        st.plotly_chart(fig_mf, use_container_width=True)
+                else:
+                    st.warning(f"Could not fetch data for {fund['name'][:40]}")
+
+            if mf_rows:
+                mf_df = pd.DataFrame(mf_rows)
+                fmt={}
+                for col in ['Current NAV','Avg NAV']: fmt[col]='₹{:,.2f}'
+                for col in ['1M Ret%','3M Ret%','1Y Ret%','P&L%']: fmt[col]='{:+.2f}%'
+                for col in ['Current Val','P&L']: fmt[col]='₹{:,.2f}'
+                st.dataframe(mf_df.style.format({k:v for k,v in fmt.items() if k in mf_df.columns}).map(cpnl,subset=[c for c in ['P&L','P&L%'] if c in mf_df.columns]),use_container_width=True,height=300)
+
+# ══════════════════════════════════════════════════════════════════════
+# SETTINGS & ALERTS
+# ══════════════════════════════════════════════════════════════════════
+elif "Settings" in menu or "⚙️" in menu:
+    st.markdown("<h3>⚙️ Settings & Alert Configuration</h3>", unsafe_allow_html=True)
+    s1,s2,s3 = st.tabs(["📧 Email","📱 Telegram","🎯 Price Alerts"])
+
+    with s1:
+        st.markdown("#### Gmail Email Alerts")
+        st.caption("Requires a Gmail **App Password** — generate at myaccount.google.com → Security → App Passwords.")
+        em_en  = st.checkbox("Enable Email Alerts", value=_cfg.get("email_enabled",False))
+        em_s   = st.text_input("Sender Gmail",    value=_cfg.get("email_sender",""),    placeholder="you@gmail.com")
+        em_p   = st.text_input("App Password",    value=_cfg.get("email_password",""),  type="password")
+        em_r   = st.text_input("Recipient Email", value=_cfg.get("email_recipient",""), placeholder="you@gmail.com")
+        if st.button("💾 Save Email Settings", use_container_width=True):
+            _cfg.update({"email_enabled":em_en,"email_sender":em_s,"email_password":em_p,"email_recipient":em_r})
+            save_settings(_cfg); st.session_state.settings=_cfg; st.success("✅ Saved!")
+        if st.button("🧪 Test Email", use_container_width=True):
+            ok,msg = send_email(em_s,em_p,em_r or em_s,"AlphaPortfolio Test","✅ Email alerts are working!")
+            st.success("Test sent!") if ok else st.error(f"Failed: {msg}")
+
+    with s2:
+        st.markdown("#### Telegram Bot Alerts")
+        st.caption("Create a bot via @BotFather → get token. Message your bot once, then get Chat ID from @userinfobot.")
+        tg_en  = st.checkbox("Enable Telegram Alerts", value=_cfg.get("telegram_enabled",False))
+        tg_tok = st.text_input("Bot Token",  value=_cfg.get("telegram_token",""),  placeholder="123456:ABC-DEF…")
+        tg_cid = st.text_input("Chat ID",    value=_cfg.get("telegram_chat_id",""),placeholder="123456789")
+        if st.button("💾 Save Telegram Settings", use_container_width=True):
+            _cfg.update({"telegram_enabled":tg_en,"telegram_token":tg_tok,"telegram_chat_id":tg_cid})
+            save_settings(_cfg); st.session_state.settings=_cfg; st.success("✅ Saved!")
+        if st.button("🧪 Test Telegram", use_container_width=True):
+            ok,msg = send_telegram(tg_tok,tg_cid,"✅ <b>AlphaPortfolio</b> Telegram alerts working!")
+            st.success("Sent!") if ok else st.error(f"Failed: {msg}")
+
+    with s3:
+        st.markdown("#### 🎯 Price Target & Stop-Loss Alerts")
+        existing = load_price_alerts()
+        with st.form("pa_form",clear_on_submit=True):
+            pa1,pa2,pa3,pa4 = st.columns(4)
+            pa_tk = pa1.text_input("Yahoo Ticker",placeholder="RELIANCE.NS")
+            pa_nm = pa2.text_input("Label",placeholder="Reliance")
+            pa_tg = pa3.number_input("Target ₹",min_value=0.0,step=1.0,format="%.2f")
+            pa_st = pa4.number_input("Stop ₹",  min_value=0.0,step=1.0,format="%.2f")
+            if st.form_submit_button("➕ Add Alert",use_container_width=True):
+                if pa_tk.strip():
+                    existing[pa_tk.strip().upper()]={"name":pa_nm.strip() or pa_tk,"target":pa_tg or None,"stop":pa_st or None}
+                    save_price_alerts(existing); st.success("Alert added!"); st.rerun()
+        if existing:
+            for tk,al in existing.items():
+                ac1,ac2,ac3,ac4=st.columns([2,2,2,1])
+                ac1.write(f"**{tk}**"); ac2.caption(f"🎯 ₹{al.get('target','—')}" if al.get('target') else "🎯 No target")
+                ac3.caption(f"🛑 ₹{al.get('stop','—')}" if al.get('stop') else "🛑 No stop")
+                if ac4.button("🗑️",key=f"da_{tk}"):
+                    existing.pop(tk,None); save_price_alerts(existing); st.rerun()
+
+# ══════════════════════════════════════════════════════════════════════
+# NEWS FEED
+# ══════════════════════════════════════════════════════════════════════
+elif "News" in menu or "📰" in menu:
     st.markdown("<h3>📰 Market News Feed</h3>", unsafe_allow_html=True)
+    st.caption("Google News + Economic Times + Business Standard + Moneycontrol | Last 14 days only")
 
-    news_query = st.text_input("Search news for any ticker or company:", placeholder="e.g. RELIANCE.NS, TCS, Infosys")
+    news_q = st.text_input("Search news for any ticker or company:", placeholder="e.g. Reliance Industries, TCS.NS, Infosys")
     news_tickers = []
-
-    if news_query.strip():
-        # Manual search
-        tk = news_query.strip().upper() if _looks_like_ticker(news_query.strip()) else _search_yahoo_symbol(news_query.strip())
-        if tk:
-            news_tickers = [tk]
-
+    if news_q.strip():
+        tk_ = news_q.strip().upper() if _is_ticker(news_q.strip()) else _yahoo_search(news_q.strip())
+        if tk_: news_tickers=[tk_]
     elif not df.empty:
-        # Auto-load from uploaded file — resolve tickers on the fly if not already done
-        if 'resolved_ticker' in df.columns:
-            # Already resolved (user visited Overview tab first)
-            news_tickers = [t for t in df['resolved_ticker'].dropna().unique() if t]
-        else:
-            # File uploaded but not yet processed — resolve tickers now
-            df_news = df.copy()
-            df_news.columns = df_news.columns.str.strip()
-            news_cols = list(df_news.columns)
-
-            # Pick the ticker/company column using saved mapping or first column
-            saved_pm_news = st.session_state.saved_mappings.get("portfolio", {})
-            ticker_col_news = saved_pm_news.get("ticker", news_cols[0]) if saved_pm_news.get("ticker") in news_cols else news_cols[0]
-
-            st.caption(f"📋 Auto-loading news for holdings from column: **{ticker_col_news}** — uses saved mapping or first column. Go to Overview Dashboard to change column mapping.")
-
-            raw_names = [str(v).strip() for v in df_news[ticker_col_news].dropna().unique() if str(v).strip()]
-            raw_names = [v for v in raw_names if v and not any(x in v.upper() for x in ['TOTAL','GRAND'])][:60]
-
-            if raw_names:
-                manual_ov = tuple(sorted(st.session_state.manual_ticker_overrides.items()))
-                with st.spinner(f"🔎 Resolving {len(raw_names)} company names to Yahoo tickers for news..."):
-                    resolution = resolve_tickers(tuple(raw_names), manual_ov)
-                news_tickers = sorted({t for t in resolution.values() if t})
+        df_n = df.copy(); df_n.columns = df_n.columns.str.strip(); nc=list(df_n.columns)
+        saved_pm = st.session_state.mappings.get("portfolio",{})
+        tc_n = saved_pm.get("ticker",nc[0]) if saved_pm.get("ticker") in nc else nc[0]
+        raw_n=[str(v).strip() for v in df_n[tc_n].dropna().unique() if str(v).strip()][:60]
+        raw_n=[v for v in raw_n if v and not any(x in v.upper() for x in ['TOTAL','GRAND'])]
+        if raw_n:
+            with st.spinner("Resolving tickers..."):
+                res_n=resolve_tickers(tuple(raw_n),tuple(sorted(st.session_state.overrides.items())))
+            news_tickers=sorted({t for t in res_n.values() if t})
 
     if news_tickers:
-        st.caption(f"Loading news for {len(news_tickers)} stock(s)...")
-        with st.spinner("Fetching latest news (Google News + Economic Times)..."):
-            news_items = fetch_stock_news(tuple(news_tickers[:20]))
-
+        with st.spinner(f"Fetching news for {len(news_tickers)} stock(s)..."):
+            news_items = fetch_news(tuple(news_tickers[:20]))
         if news_items:
-            st.caption(f"📅 Showing last **14 days** of news only | Source: Google News + Economic Times")
-            st.markdown(f"**{len(news_items)} articles** across {len(set(n['ticker'] for n in news_items))} source(s).")
-            filter_ticker = st.selectbox("Filter by stock:", ["All"] + sorted(set(n['ticker'] for n in news_items)))
-            filtered = [n for n in news_items if filter_ticker == "All" or n['ticker'] == filter_ticker]
-            for n in filtered:
-                st.markdown(f"""<div class="news-card">
-                    <a href="{n['link']}" target="_blank" style="text-decoration:none;">
-                    <div class="news-title">{n['title']}</div></a>
-                    <div class="news-meta">
-                        📌 <b>{n['ticker']}</b> &nbsp;|&nbsp;
-                        🗞️ {n.get('source','News')} &nbsp;|&nbsp;
-                        🕐 {n.get('published','')}
-                    </div>
-                    {f'<div style="color:#8b949e;font-size:12px;margin-top:6px;">{n["summary"]}…</div>' if n.get('summary') else ''}
-                </div>""", unsafe_allow_html=True)
+            st.caption(f"📅 Last 14 days | **{len(news_items)} articles**")
+            ftk = st.selectbox("Filter:", ["All"]+sorted(set(n['ticker'] for n in news_items)))
+            for n in [x for x in news_items if ftk=="All" or x['ticker']==ftk]:
+                summary_html = f'<div style="color:#8b949e;font-size:12px;margin-top:4px;">{n["summary"]}…</div>' if n.get("summary") else ""
+                card_html = (
+                    f'<div class="nc"><a href="{n["link"]}" target="_blank" style="text-decoration:none;">'
+                    f'<div class="nt">{n["title"]}</div></a>'
+                    f'<div class="nm">📌 <b>{n["ticker"]}</b> | 🗞️ {n.get("source","")} | 🕐 {n.get("published","")}</div>'
+                    f'{summary_html}</div>'
+                )
+                st.markdown(card_html, unsafe_allow_html=True)
         else:
-            st.warning("⚠️ No news found in the last 2 weeks for your portfolio stocks. Try searching a specific company name in the box above (e.g. 'Reliance Industries' or 'Infosys').")
+            st.warning("No news found in last 14 days. Try searching a specific company name above.")
     else:
-        if df.empty:
-            st.info("💡 Upload your portfolio file above, or type a ticker/company name to search for news.")
+        st.info("💡 Upload portfolio file, or search for a company/ticker above.")
 
 # ══════════════════════════════════════════════════════════════════════
 # SEARCH ANY STOCK
 # ══════════════════════════════════════════════════════════════════════
 elif "Search Any Stock" in menu or "🔎" in menu:
     st.markdown("<h3>🔎 Search Any Stock</h3>", unsafe_allow_html=True)
-    st.caption("Type 2+ letters — suggestions appear automatically.")
-
-    search_query = st.text_input("🔍 Type company name or ticker:", placeholder="e.g. Reliance, TCS, Apple…", key="search_box_input")
-    confirmed_ticker = st.session_state.search_selected_ticker
-    if not search_query and confirmed_ticker:
-        st.session_state.search_selected_ticker = ""; confirmed_ticker = ""
-
-    if search_query and len(search_query.strip()) >= 2:
-        suggestions = fetch_search_suggestions(search_query.strip())
-        if suggestions:
-            options = [s["label"] for s in suggestions]; tickers=[s["ticker"] for s in suggestions]
-            prev_label = next((s["label"] for s in suggestions if s["ticker"]==confirmed_ticker), None)
-            chosen_label = st.selectbox(f"📋 {len(suggestions)} match(es):", options, index=options.index(prev_label) if prev_label else 0, key=f"sd_{search_query[:20]}")
-            auto_ticker = tickers[options.index(chosen_label)]
-            if auto_ticker != confirmed_ticker:
-                st.session_state.search_selected_ticker = auto_ticker; confirmed_ticker = auto_ticker
+    sq = st.text_input("Company name or ticker:", placeholder="Reliance, TCS, Apple, INFY.NS…", key="sbox")
+    ct = st.session_state.search_ticker
+    if not sq and ct: st.session_state.search_ticker=""; ct=""
+    if sq and len(sq.strip())>=2:
+        suggs=fetch_suggestions(sq.strip())
+        if suggs:
+            opts=[s["label"] for s in suggs]; tks=[s["ticker"] for s in suggs]
+            prev=next((s["label"] for s in suggs if s["ticker"]==ct),None)
+            cho=st.selectbox(f"{len(suggs)} match(es):",opts,index=opts.index(prev) if prev else 0,key=f"sd_{sq[:15]}")
+            atk=tks[opts.index(cho)]
+            if atk!=ct: st.session_state.search_ticker=atk; ct=atk
+        else: st.info("No suggestions."); ct=""
+    if ct:
+        _,cc=st.columns([5,1])
+        if cc.button("✖ Clear",use_container_width=True): st.session_state.search_ticker=""; st.rerun()
+        with st.spinner(f"Loading {ct}…"): res=search_stock_full(ct)
+        if res is None: st.error(f"Could not fetch {ct}.")
         else:
-            st.info("No suggestions found."); confirmed_ticker = ""
-
-    if confirmed_ticker:
-        _,clr_col = st.columns([5,1])
-        if clr_col.button("✖ Clear", use_container_width=True):
-            st.session_state.search_selected_ticker = ""; st.rerun()
-        with st.spinner(f"Loading {confirmed_ticker}…"):
-            result = search_any_stock(confirmed_ticker)
-        if result is None:
-            st.error(f"⚠️ Could not fetch data for {confirmed_ticker}.")
-        else:
-            st.markdown(f"#### {result['company_name']}  `{result['ticker']}`")
-            sc1,sc2,sc3 = st.columns(3)
-            sc1.markdown(f'<div class="terminal-card"><div class="metric-title">LIVE PRICE</div><div class="metric-value">{result["currency"]} {result["live_price"]:,.2f}</div></div>', unsafe_allow_html=True)
-            sc2.markdown(f'<div class="terminal-card"><div class="metric-title">52W HIGH</div><div class="metric-value" style="color:#3fb950;">{result["currency"]} {result["high_52w"]:,.2f}</div></div>' if result["high_52w"] else '<div class="terminal-card"><div class="metric-title">52W HIGH</div><div class="metric-value">N/A</div></div>', unsafe_allow_html=True)
-            sc3.markdown(f'<div class="terminal-card"><div class="metric-title">52W LOW</div><div class="metric-value" style="color:#f85149;">{result["currency"]} {result["low_52w"]:,.2f}</div></div>' if result["low_52w"] else '<div class="terminal-card"><div class="metric-title">52W LOW</div><div class="metric-value">N/A</div></div>', unsafe_allow_html=True)
-            if not result["history"].empty:
-                fig_s = go.Figure(go.Scatter(x=result["history"].index, y=result["history"]['Close'], line=dict(color='#58a6ff'), fill='tozeroy', fillcolor='rgba(88,166,255,0.08)'))
-                fig_s.update_layout(plot_bgcolor='#161b22',paper_bgcolor='#0d1117',font=dict(color='#8b949e'),margin=dict(l=10,r=10,t=36,b=10),title=dict(text="1-Year Price Trend",font=dict(color='#e6edf3')),xaxis=dict(gridcolor='#21262d'),yaxis=dict(gridcolor='#21262d'))
-                st.plotly_chart(fig_s, use_container_width=True)
-    elif not search_query:
-        st.info("💡 Start typing above — suggestions appear automatically.")
+            st.markdown(f"#### {res['company_name']}  `{res['ticker']}`")
+            c1,c2,c3=st.columns(3)
+            c1.markdown(f'<div class="tc"><div class="mt">LIVE PRICE</div><div class="mv">{res["currency"]} {res["live_price"]:,.2f}</div></div>', unsafe_allow_html=True)
+            c2.markdown(f'<div class="tc"><div class="mt">52W HIGH</div><div class="mv" style="color:#3fb950;">{res["currency"]} {res["high_52w"]:,.2f}</div></div>' if res["high_52w"] else '<div class="tc"><div class="mt">52W HIGH</div><div class="mv">N/A</div></div>', unsafe_allow_html=True)
+            c3.markdown(f'<div class="tc"><div class="mt">52W LOW</div><div class="mv" style="color:#f85149;">{res["currency"]} {res["low_52w"]:,.2f}</div></div>' if res["low_52w"] else '<div class="tc"><div class="mt">52W LOW</div><div class="mv">N/A</div></div>', unsafe_allow_html=True)
+            if not res["history"].empty:
+                fig_s=go.Figure(go.Scatter(x=res["history"].index,y=res["history"]['Close'],line=dict(color='#58a6ff'),fill='tozeroy',fillcolor='rgba(88,166,255,0.08)'))
+                fig_s.update_layout(plot_bgcolor='#161b22',paper_bgcolor='#0d1117',font=dict(color='#8b949e'),margin=dict(l=10,r=10,t=36,b=10),title="1-Year Price",xaxis=dict(gridcolor='#21262d'),yaxis=dict(gridcolor='#21262d'))
+                st.plotly_chart(fig_s,use_container_width=True)
+    elif not sq: st.info("💡 Start typing above.")
 
 # ══════════════════════════════════════════════════════════════════════
 # TRANSACTION LEDGER
 # ══════════════════════════════════════════════════════════════════════
-elif "Transaction Ledger" in menu or "💼" in menu:
+elif "Transaction" in menu or "💼" in menu:
     st.markdown("<h2 style='color:#e6edf3;'>💼 Transaction Ledger & P&L Analytics</h2>", unsafe_allow_html=True)
-    tx_tab4, tx_tab1, tx_tab2, tx_tab3 = st.tabs(["📊 P&L Dashboard","📤 Upload Trade File","➕ Manual Entry","📜 Full Ledger"])
+    tx_t1,tx_t2,tx_t3,tx_t4 = st.tabs(["📊 P&L Dashboard","📤 Upload Trade File","➕ Manual Entry","📜 Full Ledger"])
 
-    with tx_tab4:
-        rpt = st.session_state.get("rpt_trades", pd.DataFrame())
+    with tx_t1:
+        rpt=st.session_state.get("rpt_trades",pd.DataFrame())
         if rpt.empty:
-            st.markdown("<div style='text-align:center;padding:60px 20px;'><div style='font-size:64px;'>📂</div><h3 style='color:#8b949e;margin-top:16px;'>No trades loaded yet</h3><p style='color:#6e7681;'>Go to <b>📤 Upload Trade File</b>, upload your broker's export, map columns, click Confirm.</p></div>", unsafe_allow_html=True)
+            st.markdown("<div style='text-align:center;padding:50px;'><div style='font-size:56px;'>📂</div><h3 style='color:#8b949e;'>No trades loaded</h3><p style='color:#6e7681;'>Go to <b>📤 Upload Trade File</b> tab.</p></div>",unsafe_allow_html=True)
         else:
-            tb  = rpt["buy_value"].sum();  ts_  = rpt["sell_value"].sum()
-            tp  = rpt["realized_pnl"].sum()
-            sdf = rpt[rpt["tax_term"]=="STCG (<1yr)"]; ldf = rpt[rpt["tax_term"]=="LTCG (>1yr)"]
-            sp  = sdf["realized_pnl"].sum();  lp  = ldf["realized_pnl"].sum()
-            pw  = (rpt["realized_pnl"]>0).sum(); pl = (rpt["realized_pnl"]<0).sum()
-            wr  = pw/len(rpt)*100 if len(rpt)>0 else 0
-            aw  = rpt[rpt["realized_pnl"]>0]["realized_pnl"].mean() if pw>0 else 0
-            al  = rpt[rpt["realized_pnl"]<0]["realized_pnl"].mean() if pl>0 else 0
-            bt  = rpt.loc[rpt["realized_pnl"].idxmax()] if len(rpt)>0 else None
-            wt  = rpt.loc[rpt["realized_pnl"].idxmin()] if len(rpt)>0 else None
-            etx = max(0,sp)*0.20 + (max(0,lp-100000)*0.125 if lp>100000 else 0)
-
-            st.markdown("### 📈 Realized P&L Summary")
-            k1,k2,k3,k4,k5,k6 = st.columns(6)
-            pc = "#3fb950" if tp>=0 else "#f85149"
-            k1.markdown(f'<div class="terminal-card"><div class="metric-title">TOTAL REALIZED P&L</div><div class="metric-value" style="color:{pc};">₹{tp:,.0f}</div></div>', unsafe_allow_html=True)
-            k2.markdown(f'<div class="terminal-card"><div class="metric-title">TOTAL BUY VALUE</div><div class="metric-value">₹{tb:,.0f}</div></div>', unsafe_allow_html=True)
-            k3.markdown(f'<div class="terminal-card"><div class="metric-title">TOTAL SELL VALUE</div><div class="metric-value">₹{ts_:,.0f}</div></div>', unsafe_allow_html=True)
-            k4.markdown(f'<div class="terminal-card"><div class="metric-title">WIN RATE</div><div class="metric-value" style="color:#58a6ff;">{wr:.1f}%</div><div class="metric-status-blue">{pw}W / {pl}L / {len(rpt)}T</div></div>', unsafe_allow_html=True)
-            k5.markdown(f'<div class="terminal-card"><div class="metric-title">STCG P&L</div><div class="metric-value" style="color:{"#3fb950" if sp>=0 else "#f85149"};">₹{sp:,.0f}</div><div class="metric-status-blue">Tax ₹{max(0,sp)*0.20:,.0f}</div></div>', unsafe_allow_html=True)
-            k6.markdown(f'<div class="terminal-card"><div class="metric-title">LTCG P&L</div><div class="metric-value" style="color:{"#3fb950" if lp>=0 else "#f85149"};">₹{lp:,.0f}</div><div class="metric-status-blue">Tax ₹{max(0,lp-100000)*0.125 if lp>100000 else 0:,.0f}</div></div>', unsafe_allow_html=True)
-
+            tb=rpt["buy_value"].sum(); ts=rpt["sell_value"].sum(); tp=rpt["realized_pnl"].sum()
+            sd=rpt[rpt["tax_term"]=="STCG (<1yr)"]; ld=rpt[rpt["tax_term"]=="LTCG (>1yr)"]
+            sp=sd["realized_pnl"].sum(); lp=ld["realized_pnl"].sum()
+            pw=(rpt["realized_pnl"]>0).sum(); pl=(rpt["realized_pnl"]<0).sum()
+            wr=pw/len(rpt)*100 if len(rpt)>0 else 0
+            aw=rpt[rpt["realized_pnl"]>0]["realized_pnl"].mean() if pw>0 else 0
+            al_=rpt[rpt["realized_pnl"]<0]["realized_pnl"].mean() if pl>0 else 0
+            bt=rpt.loc[rpt["realized_pnl"].idxmax()] if len(rpt)>0 else None
+            wt=rpt.loc[rpt["realized_pnl"].idxmin()] if len(rpt)>0 else None
+            etx=max(0,sp)*0.20+(max(0,lp-100000)*0.125 if lp>100000 else 0)
+            st.markdown("### 📈 P&L Summary")
+            k1,k2,k3,k4,k5,k6=st.columns(6)
+            pc="#3fb950" if tp>=0 else "#f85149"
+            k1.markdown(f'<div class="tc"><div class="mt">TOTAL P&L</div><div class="mv" style="color:{pc};">₹{tp:,.0f}</div></div>',unsafe_allow_html=True)
+            k2.markdown(f'<div class="tc"><div class="mt">BUY VALUE</div><div class="mv">₹{tb:,.0f}</div></div>',unsafe_allow_html=True)
+            k3.markdown(f'<div class="tc"><div class="mt">SELL VALUE</div><div class="mv">₹{ts:,.0f}</div></div>',unsafe_allow_html=True)
+            k4.markdown(f'<div class="tc"><div class="mt">WIN RATE</div><div class="mv" style="color:#58a6ff;">{wr:.1f}%</div><div class="mb">{pw}W / {pl}L</div></div>',unsafe_allow_html=True)
+            k5.markdown(f'<div class="tc"><div class="mt">STCG</div><div class="mv" style="color:{"#3fb950" if sp>=0 else "#f85149"};">₹{sp:,.0f}</div><div class="mb">Tax ₹{max(0,sp)*0.20:,.0f}</div></div>',unsafe_allow_html=True)
+            k6.markdown(f'<div class="tc"><div class="mt">LTCG</div><div class="mv" style="color:{"#3fb950" if lp>=0 else "#f85149"};">₹{lp:,.0f}</div><div class="mb">Tax ₹{max(0,lp-100000)*0.125 if lp>100000 else 0:,.0f}</div></div>',unsafe_allow_html=True)
             st.markdown("---")
-            b1,b2,b3,b4 = st.columns(4)
-            b1.markdown(f'<div class="terminal-card"><div class="metric-title">TOTAL EST. TAX</div><div class="metric-value" style="color:#e3b341;">₹{etx:,.0f}</div></div>', unsafe_allow_html=True)
-            b2.markdown(f'<div class="terminal-card"><div class="metric-title">AVG WINNING TRADE</div><div class="metric-value" style="color:#3fb950;">₹{aw:,.0f}</div></div>', unsafe_allow_html=True)
-            b3.markdown(f'<div class="terminal-card"><div class="metric-title">AVG LOSING TRADE</div><div class="metric-value" style="color:#f85149;">₹{al:,.0f}</div></div>', unsafe_allow_html=True)
-            rr = abs(aw/al) if al!=0 else 0
-            b4.markdown(f'<div class="terminal-card"><div class="metric-title">RISK:REWARD</div><div class="metric-value" style="color:#58a6ff;">1 : {rr:.2f}</div></div>', unsafe_allow_html=True)
-
+            b1,b2,b3,b4=st.columns(4)
+            b1.markdown(f'<div class="tc"><div class="mt">EST. TAX</div><div class="mv" style="color:#e3b341;">₹{etx:,.0f}</div></div>',unsafe_allow_html=True)
+            b2.markdown(f'<div class="tc"><div class="mt">AVG WIN</div><div class="mv" style="color:#3fb950;">₹{aw:,.0f}</div></div>',unsafe_allow_html=True)
+            b3.markdown(f'<div class="tc"><div class="mt">AVG LOSS</div><div class="mv" style="color:#f85149;">₹{al_:,.0f}</div></div>',unsafe_allow_html=True)
+            rr=abs(aw/al_) if al_!=0 else 0
+            b4.markdown(f'<div class="tc"><div class="mt">RISK:REWARD</div><div class="mv" style="color:#58a6ff;">1:{rr:.2f}</div></div>',unsafe_allow_html=True)
             if bt is not None and wt is not None:
-                bw1,bw2 = st.columns(2)
-                bw1.markdown(f'<div class="alert-box-high">🏆 <b>BEST TRADE</b> — {bt["share_name"]}<br>Buy ₹{bt["buy_price"]:,.2f} → Sell ₹{bt["sell_price"]:,.2f} × {bt["quantity"]:.0f}<br><b style="font-size:18px;">P&L: ₹{bt["realized_pnl"]:,.2f}</b> | {bt["tax_term"]}</div>', unsafe_allow_html=True)
-                bw2.markdown(f'<div class="alert-box-low">📉 <b>WORST TRADE</b> — {wt["share_name"]}<br>Buy ₹{wt["buy_price"]:,.2f} → Sell ₹{wt["sell_price"]:,.2f} × {wt["quantity"]:.0f}<br><b style="font-size:18px;">P&L: ₹{wt["realized_pnl"]:,.2f}</b> | {wt["tax_term"]}</div>', unsafe_allow_html=True)
-
-            st.caption("⚠️ Tax estimate is indicative. LTCG exempt up to ₹1 lakh/year. Consult a CA.")
+                bw1,bw2=st.columns(2)
+                bw1.markdown(f'<div class="ah">🏆 <b>BEST</b> — {bt["share_name"]}<br>Buy ₹{bt["buy_price"]:,.2f} → Sell ₹{bt["sell_price"]:,.2f} × {bt["quantity"]:.0f}<br><b>P&L: ₹{bt["realized_pnl"]:,.2f}</b></div>',unsafe_allow_html=True)
+                bw2.markdown(f'<div class="al">📉 <b>WORST</b> — {wt["share_name"]}<br>Buy ₹{wt["buy_price"]:,.2f} → Sell ₹{wt["sell_price"]:,.2f} × {wt["quantity"]:.0f}<br><b>P&L: ₹{wt["realized_pnl"]:,.2f}</b></div>',unsafe_allow_html=True)
+            st.caption("⚠️ Tax indicative only. LTCG exempt ₹1L/year. Consult a CA.")
             st.markdown("---")
-            ch1,ch2 = st.columns(2)
+            ch1,ch2=st.columns(2)
             with ch1:
-                st.markdown("#### 📅 Monthly Realized P&L")
-                rpt_m = rpt.copy(); rpt_m["month"] = rpt_m["sell_date"].dt.to_period("M").astype(str)
-                monthly = rpt_m.groupby("month")["realized_pnl"].sum().reset_index()
-                fig_m = go.Figure(go.Bar(x=monthly["month"],y=monthly["realized_pnl"],marker_color=["#3fb950" if v>=0 else "#f85149" for v in monthly["realized_pnl"]],text=monthly["realized_pnl"].apply(lambda v:f"₹{v:,.0f}"),textposition="auto"))
+                st.markdown("#### 📅 Monthly P&L")
+                rm=rpt.copy(); rm["month"]=rm["sell_date"].dt.to_period("M").astype(str)
+                mo=rm.groupby("month")["realized_pnl"].sum().reset_index()
+                fig_m=go.Figure(go.Bar(x=mo["month"],y=mo["realized_pnl"],marker_color=["#3fb950" if v>=0 else "#f85149" for v in mo["realized_pnl"]],text=mo["realized_pnl"].apply(lambda v:f"₹{v:,.0f}"),textposition="auto"))
                 fig_m.update_layout(plot_bgcolor='#161b22',paper_bgcolor='#0d1117',font=dict(color='#8b949e'),margin=dict(l=10,r=10,t=10,b=10),xaxis=dict(gridcolor='#21262d',tickangle=-45),yaxis=dict(gridcolor='#21262d'))
-                st.plotly_chart(fig_m, use_container_width=True)
+                st.plotly_chart(fig_m,use_container_width=True)
             with ch2:
                 st.markdown("#### 📈 Cumulative P&L")
-                rs = rpt.sort_values("sell_date").copy(); rs["cumulative_pnl"] = rs["realized_pnl"].cumsum()
-                fig_c = go.Figure()
-                fig_c.add_trace(go.Scatter(x=rs["sell_date"],y=rs["cumulative_pnl"],line=dict(color='#58a6ff',width=2),fill='tozeroy',fillcolor='rgba(88,166,255,0.08)'))
+                rs=rpt.sort_values("sell_date").copy(); rs["cum"]=rs["realized_pnl"].cumsum()
+                fig_c=go.Figure(go.Scatter(x=rs["sell_date"],y=rs["cum"],line=dict(color='#58a6ff',width=2),fill='tozeroy',fillcolor='rgba(88,166,255,0.08)'))
                 fig_c.add_hline(y=0,line_dash="dot",line_color="#8b949e")
                 fig_c.update_layout(plot_bgcolor='#161b22',paper_bgcolor='#0d1117',font=dict(color='#8b949e'),margin=dict(l=10,r=10,t=10,b=10),xaxis=dict(gridcolor='#21262d'),yaxis=dict(gridcolor='#21262d'),showlegend=False)
-                st.plotly_chart(fig_c, use_container_width=True)
-            ch3,ch4 = st.columns(2)
+                st.plotly_chart(fig_c,use_container_width=True)
+            ch3,ch4=st.columns(2)
             with ch3:
                 st.markdown("#### 🏆 Top Gainers & Losers")
-                by_s = rpt.groupby("share_name",as_index=False)["realized_pnl"].sum().sort_values("realized_pnl")
-                tn = pd.concat([by_s.head(5),by_s.tail(5)]).drop_duplicates()
-                fig_gl = go.Figure(go.Bar(x=tn["realized_pnl"],y=tn["share_name"],orientation='h',marker_color=["#3fb950" if v>=0 else "#f85149" for v in tn["realized_pnl"]],text=tn["realized_pnl"].apply(lambda v:f"₹{v:,.0f}"),textposition="auto"))
+                bs=rpt.groupby("share_name",as_index=False)["realized_pnl"].sum().sort_values("realized_pnl")
+                tn=pd.concat([bs.head(5),bs.tail(5)]).drop_duplicates()
+                fig_gl=go.Figure(go.Bar(x=tn["realized_pnl"],y=tn["share_name"],orientation='h',marker_color=["#3fb950" if v>=0 else "#f85149" for v in tn["realized_pnl"]],text=tn["realized_pnl"].apply(lambda v:f"₹{v:,.0f}"),textposition="auto"))
                 fig_gl.update_layout(plot_bgcolor='#161b22',paper_bgcolor='#0d1117',font=dict(color='#8b949e'),margin=dict(l=10,r=10,t=10,b=10),xaxis=dict(gridcolor='#21262d'),yaxis=dict(gridcolor='#21262d'))
-                st.plotly_chart(fig_gl, use_container_width=True)
+                st.plotly_chart(fig_gl,use_container_width=True)
             with ch4:
                 st.markdown("#### 🥧 STCG vs LTCG")
-                fig_tax = go.Figure(go.Pie(labels=["STCG (<1yr)","LTCG (>1yr)"],values=[max(0.01,len(sdf)),max(0.01,len(ldf))],hole=0.55,marker=dict(colors=["#58a6ff","#3fb950"]),textinfo="label+percent"))
+                fig_tax=go.Figure(go.Pie(labels=["STCG","LTCG"],values=[max(0.01,len(sd)),max(0.01,len(ld))],hole=0.55,marker=dict(colors=["#58a6ff","#3fb950"]),textinfo="label+percent"))
                 fig_tax.update_layout(paper_bgcolor='#0d1117',font=dict(color='#8b949e'),margin=dict(l=10,r=10,t=10,b=10))
-                st.plotly_chart(fig_tax, use_container_width=True)
+                st.plotly_chart(fig_tax,use_container_width=True)
             st.markdown("---")
-            st.markdown("#### 🔍 Stock-wise P&L Filter")
-            all_stk = ["All Stocks"] + sorted(rpt["share_name"].unique().tolist())
-            sel_stk = st.selectbox("Select stock:", all_stk)
-            rpt_f = rpt if sel_stk=="All Stocks" else rpt[rpt["share_name"]==sel_stk]
-            if sel_stk!="All Stocks":
-                fs1,fs2,fs3 = st.columns(3)
-                spnl=rpt_f["realized_pnl"].sum()
-                fs1.markdown(f'<div class="terminal-card"><div class="metric-title">{sel_stk[:20]} P&L</div><div class="metric-value" style="color:{"#3fb950" if spnl>=0 else "#f85149"};">₹{spnl:,.2f}</div></div>', unsafe_allow_html=True)
-                fs2.markdown(f'<div class="terminal-card"><div class="metric-title">TRADES</div><div class="metric-value">{len(rpt_f)}</div></div>', unsafe_allow_html=True)
-                fs3.markdown(f'<div class="terminal-card"><div class="metric-title">WIN RATE</div><div class="metric-value" style="color:#58a6ff;">{(rpt_f["realized_pnl"]>0).sum()/len(rpt_f)*100:.1f}%</div></div>', unsafe_allow_html=True)
-            sr = rpt_f.copy()
-            sr["buy_date"]  = pd.to_datetime(sr["buy_date"],  errors='coerce').dt.strftime("%d %b %Y")
-            sr["sell_date"] = pd.to_datetime(sr["sell_date"], errors='coerce').dt.strftime("%d %b %Y")
-            sr = sr.rename(columns={"share_name":"Company","quantity":"Qty","buy_date":"Purchase Date","buy_price":"Buy Price","buy_value":"Buy Value","sell_date":"Sell Date","sell_price":"Sell Price","sell_value":"Sell Value","realized_pnl":"P&L (₹)","holding_days":"Days Held","tax_term":"Tax Term"})
-            dcols = [c for c in ["Company","Qty","Purchase Date","Buy Price","Buy Value","Sell Date","Sell Price","Sell Value","P&L (₹)","Days Held","Tax Term"] if c in sr.columns]
-            st.dataframe(sr[dcols].style.format({"Buy Price":"₹{:,.2f}","Buy Value":"₹{:,.2f}","Sell Price":"₹{:,.2f}","Sell Value":"₹{:,.2f}","P&L (₹)":"₹{:,.2f}"}).map(color_pnl,subset=["P&L (₹)"]),use_container_width=True,height=380)
-            st.download_button("📥 Download CSV",data=sr[dcols].to_csv(index=False).encode("utf-8"),file_name=f"trades_{sel_stk.replace(' ','_')}.csv",mime="text/csv",use_container_width=True)
+            alls=["All Stocks"]+sorted(rpt["share_name"].unique().tolist())
+            ss=st.selectbox("Filter by stock:",alls)
+            rf=rpt if ss=="All Stocks" else rpt[rpt["share_name"]==ss]
+            if ss!="All Stocks":
+                fs1,fs2,fs3=st.columns(3)
+                sp_=rf["realized_pnl"].sum()
+                fs1.markdown(f'<div class="tc"><div class="mt">P&L</div><div class="mv" style="color:{"#3fb950" if sp_>=0 else "#f85149"};">₹{sp_:,.2f}</div></div>',unsafe_allow_html=True)
+                fs2.markdown(f'<div class="tc"><div class="mt">TRADES</div><div class="mv">{len(rf)}</div></div>',unsafe_allow_html=True)
+                fs3.markdown(f'<div class="tc"><div class="mt">WIN RATE</div><div class="mv" style="color:#58a6ff;">{(rf["realized_pnl"]>0).sum()/len(rf)*100:.1f}%</div></div>',unsafe_allow_html=True)
+            sr=rf.copy()
+            for dc in ['buy_date','sell_date']:
+                if dc in sr.columns: sr[dc]=pd.to_datetime(sr[dc],errors='coerce').dt.strftime("%d %b %Y")
+            sr=sr.rename(columns={"share_name":"Company","quantity":"Qty","buy_date":"Buy Date","buy_price":"Buy ₹","buy_value":"Buy Value","sell_date":"Sell Date","sell_price":"Sell ₹","sell_value":"Sell Value","realized_pnl":"P&L (₹)","holding_days":"Days","tax_term":"Term"})
+            dcols=[c for c in ["Company","Qty","Buy Date","Buy ₹","Buy Value","Sell Date","Sell ₹","Sell Value","P&L (₹)","Days","Term"] if c in sr.columns]
+            st.dataframe(sr[dcols].style.format({"Buy ₹":"₹{:,.2f}","Buy Value":"₹{:,.2f}","Sell ₹":"₹{:,.2f}","Sell Value":"₹{:,.2f}","P&L (₹)":"₹{:,.2f}"}).map(cpnl,subset=["P&L (₹)"]),use_container_width=True,height=350)
+            st.download_button("📥 Download CSV",data=sr[dcols].to_csv(index=False).encode("utf-8"),file_name="trades.csv",mime="text/csv",use_container_width=True)
 
-    with tx_tab1:
-        st.caption("Upload your broker's trade export. Map columns below — saved mapping is applied automatically.")
-        rpt_file = st.file_uploader("Upload trade file", type=['csv','xlsx'], key="rpt_upload")
-        if rpt_file is not None:
+    with tx_t2:
+        st.caption("Upload your broker's P&L export. Map columns below — saved mapping applied automatically.")
+        rpt_file=st.file_uploader("Upload trade file",type=['csv','xlsx'],key="rpt_up")
+        if rpt_file:
             try:
-                rpt_df = pd.read_excel(rpt_file) if rpt_file.name.endswith('.xlsx') else pd.read_csv(rpt_file)
-                rpt_cols = [c.strip() for c in rpt_df.columns]; rpt_df.columns = rpt_cols
-                rpt_lower = [c.lower() for c in rpt_cols]
-                saved_rpt = st.session_state.saved_mappings.get("rpt",{})
-                def _rpt_idx(key,kws,fb=0):
-                    if key in saved_rpt and saved_rpt[key] in rpt_cols: return rpt_cols.index(saved_rpt[key])+1
-                    m = next((i for i,c in enumerate(rpt_lower) if any(kw in c for kw in kws)),-1)
+                rdf=pd.read_excel(rpt_file) if rpt_file.name.endswith('.xlsx') else pd.read_csv(rpt_file)
+                rcols=[c.strip() for c in rdf.columns]; rdf.columns=rcols; rl=[c.lower() for c in rcols]
+                srpt=st.session_state.mappings.get("rpt",{})
+                def _ri(k,kws,fb=0):
+                    if k in srpt and srpt[k] in rcols: return rcols.index(srpt[k])+1
+                    m=next((i for i,c in enumerate(rl) if any(kw in c for kw in kws)),-1)
                     return m+1 if m>=0 else 0
-                NONE="(None / Not in file)"; opts=[NONE]+rpt_cols
-                sn = " ✅ saved mapping applied" if saved_rpt else ""
+                NONE="(None)"; opts=[NONE]+rcols; sn=" ✅ saved" if srpt else ""
                 st.markdown(f"#### 🗺️ Column Mapping{sn}")
                 r1,r2,r3=st.columns(3); r4,r5,r6=st.columns(3); r7,r8,r9=st.columns(3); r10,_,sc=st.columns([3,1,1])
-                with r1:  m_name=st.selectbox("🏢 Company Name *",opts,index=_rpt_idx("name",["instrument","name","company","stock","scrip"]))
-                with r2:  m_qty=st.selectbox("📦 Quantity *",opts,index=_rpt_idx("qty",["qty","quantity","shares","units","volume"]))
-                with r3:  m_isin=st.selectbox("🔖 ISIN (optional)",opts,index=_rpt_idx("isin",["isin"]))
-                with r4:  m_buy_date=st.selectbox("📅 Purchase Date *",opts,index=_rpt_idx("buy_date",["purchase date","buy date","purchasedate","purchase_date"]))
-                with r5:  m_buy_price=st.selectbox("💰 Purchase Price *",opts,index=_rpt_idx("buy_price",["purchase price","buy price","purchaseprice","purchase_price"]))
-                with r6:  m_buy_value=st.selectbox("💵 Purchase Value",opts,index=_rpt_idx("buy_value",["purchase value","purchase cost","purchasevalue","purchase_value","purchase_cost"]))
-                with r7:  m_sell_date=st.selectbox("📅 Sell Date *",opts,index=_rpt_idx("sell_date",["sell date","selldate","sell_date"]))
-                with r8:  m_sell_price=st.selectbox("💸 Sell Price *",opts,index=_rpt_idx("sell_price",["sell price","sellprice","sell_price"]))
-                with r9:  m_sell_value=st.selectbox("💵 Sell Value",opts,index=_rpt_idx("sell_value",["sell value","sellvalue","sell_value"]))
-                with r10: m_pnl=st.selectbox("📈 P&L column (pre-calc)",opts,index=_rpt_idx("pnl",["long term","g/l","gain","loss","pnl","profit","p&l","p / l"]))
+                with r1: mn=st.selectbox("🏢 Company *",opts,index=_ri("name",["instrument","name","company","stock","scrip"]))
+                with r2: mq=st.selectbox("📦 Qty *",opts,index=_ri("qty",["qty","quantity","shares","units","volume"]))
+                with r3: mi_=st.selectbox("🔖 ISIN",opts,index=_ri("isin",["isin"]))
+                with r4: mbd=st.selectbox("📅 Buy Date *",opts,index=_ri("buy_date",["purchase date","buy date","purchasedate","purchase_date"]))
+                with r5: mbp=st.selectbox("💰 Buy Price *",opts,index=_ri("buy_price",["purchase price","buy price","purchaseprice","purchase_price"]))
+                with r6: mbv=st.selectbox("💵 Buy Value",opts,index=_ri("buy_value",["purchase value","purchase cost","purchasevalue","purchase_value","purchase_cost"]))
+                with r7: msd=st.selectbox("📅 Sell Date *",opts,index=_ri("sell_date",["sell date","selldate","sell_date"]))
+                with r8: msp=st.selectbox("💸 Sell Price *",opts,index=_ri("sell_price",["sell price","sellprice","sell_price"]))
+                with r9: msv=st.selectbox("💵 Sell Value",opts,index=_ri("sell_value",["sell value","sellvalue","sell_value"]))
+                with r10: mpnl=st.selectbox("📈 P&L col",opts,index=_ri("pnl",["long term","g/l","gain","loss","pnl","profit","p&l","p / l"]))
                 with sc:
                     st.markdown("<br><br>",unsafe_allow_html=True)
-                    if st.button("💾 Save",use_container_width=True,key="save_rpt_map"):
-                        pm=st.session_state.saved_mappings
-                        pm["rpt"]={"name":m_name,"qty":m_qty,"isin":m_isin,"buy_date":m_buy_date,"buy_price":m_buy_price,"buy_value":m_buy_value,"sell_date":m_sell_date,"sell_price":m_sell_price,"sell_value":m_sell_value,"pnl":m_pnl}
-                        save_mappings(pm); st.session_state.saved_mappings=pm; st.toast("✅ Mapping saved!",icon="💾"); st.rerun()
-                req={"Company Name":m_name,"Purchase Date":m_buy_date,"Purchase Price":m_buy_price,"Sell Date":m_sell_date,"Sell Price":m_sell_price,"Quantity":m_qty}
-                miss=[k for k,v in req.items() if v==NONE]
-                if miss:
-                    st.warning(f"⚠️ Map these required fields first: **{', '.join(miss)}**")
+                    if st.button("💾 Save",use_container_width=True,key="srv"):
+                        pm=st.session_state.mappings
+                        pm["rpt"]={"name":mn,"qty":mq,"isin":mi_,"buy_date":mbd,"buy_price":mbp,"buy_value":mbv,"sell_date":msd,"sell_price":msp,"sell_value":msv,"pnl":mpnl}
+                        save_mappings(pm); st.session_state.mappings=pm; st.toast("✅ Saved!",icon="💾"); st.rerun()
+                miss=[k for k,v in {"Company":mn,"Buy Date":mbd,"Buy Price":mbp,"Sell Date":msd,"Sell Price":msp,"Qty":mq}.items() if v==NONE]
+                if miss: st.warning(f"Map required fields: **{', '.join(miss)}**")
                 else:
-                    trades=pd.DataFrame()
-                    trades["share_name"]=rpt_df[m_name].astype(str).str.strip()
-                    trades["quantity"]=pd.to_numeric(rpt_df[m_qty],errors='coerce').fillna(0)
-                    trades["buy_date"]=pd.to_datetime(rpt_df[m_buy_date],errors='coerce')
-                    trades["buy_price"]=pd.to_numeric(rpt_df[m_buy_price],errors='coerce').fillna(0)
-                    trades["sell_date"]=pd.to_datetime(rpt_df[m_sell_date],errors='coerce')
-                    trades["sell_price"]=pd.to_numeric(rpt_df[m_sell_price],errors='coerce').fillna(0)
-                    trades["buy_value"]=pd.to_numeric(rpt_df[m_buy_value],errors='coerce').fillna(0) if m_buy_value!=NONE else trades["quantity"]*trades["buy_price"]
-                    trades["sell_value"]=pd.to_numeric(rpt_df[m_sell_value],errors='coerce').fillna(0) if m_sell_value!=NONE else trades["quantity"]*trades["sell_price"]
-                    trades["isin"]=rpt_df[m_isin].astype(str).str.strip() if m_isin!=NONE else ""
-                    trades["realized_pnl"]=pd.to_numeric(rpt_df[m_pnl],errors='coerce').fillna(0) if m_pnl!=NONE else trades["sell_value"]-trades["buy_value"]
-                    trades["holding_days"]=(trades["sell_date"]-trades["buy_date"]).dt.days.fillna(0).astype(int)
-                    trades["tax_term"]=trades["holding_days"].apply(lambda d:"LTCG (>1yr)" if d>365 else "STCG (<1yr)")
-                    trades=trades.dropna(subset=["buy_date","sell_date"]); trades=trades[trades["quantity"]>0]
-                    st.markdown(f"#### 📋 Preview — {len(trades)} trades")
-                    prev=trades.copy()
-                    prev["buy_date"]=pd.to_datetime(prev["buy_date"],errors='coerce').dt.strftime("%d %b %Y")
-                    prev["sell_date"]=pd.to_datetime(prev["sell_date"],errors='coerce').dt.strftime("%d %b %Y")
-                    st.dataframe(prev[["share_name","quantity","buy_date","buy_price","sell_date","sell_price","realized_pnl","holding_days","tax_term"]].rename(columns={"share_name":"Company","quantity":"Qty","buy_date":"Buy Date","buy_price":"Buy ₹","sell_date":"Sell Date","sell_price":"Sell ₹","realized_pnl":"P&L (₹)","holding_days":"Days","tax_term":"Term"}).style.format({"Buy ₹":"₹{:,.2f}","Sell ₹":"₹{:,.2f}","P&L (₹)":"₹{:,.2f}"}).map(color_pnl,subset=["P&L (₹)"]),use_container_width=True,height=260)
-                    if st.button("✅ Confirm & Load to P&L Dashboard",use_container_width=True,key="confirm_rpt"):
-                        st.session_state["rpt_trades"]=trades; st.success(f"✅ {len(trades)} trades loaded!"); st.rerun()
-            except Exception as e:
-                st.error(f"⚠️ Could not read file: {e}")
+                    trd=pd.DataFrame()
+                    trd["share_name"]=rdf[mn].astype(str).str.strip()
+                    trd["quantity"]=pd.to_numeric(rdf[mq],errors='coerce').fillna(0)
+                    trd["buy_date"]=pd.to_datetime(rdf[mbd],errors='coerce')
+                    trd["buy_price"]=pd.to_numeric(rdf[mbp],errors='coerce').fillna(0)
+                    trd["sell_date"]=pd.to_datetime(rdf[msd],errors='coerce')
+                    trd["sell_price"]=pd.to_numeric(rdf[msp],errors='coerce').fillna(0)
+                    trd["buy_value"]=pd.to_numeric(rdf[mbv],errors='coerce').fillna(0) if mbv!=NONE else trd["quantity"]*trd["buy_price"]
+                    trd["sell_value"]=pd.to_numeric(rdf[msv],errors='coerce').fillna(0) if msv!=NONE else trd["quantity"]*trd["sell_price"]
+                    trd["isin"]=rdf[mi_].astype(str).str.strip() if mi_!=NONE else ""
+                    trd["realized_pnl"]=pd.to_numeric(rdf[mpnl],errors='coerce').fillna(0) if mpnl!=NONE else trd["sell_value"]-trd["buy_value"]
+                    trd["holding_days"]=(trd["sell_date"]-trd["buy_date"]).dt.days.fillna(0).astype(int)
+                    trd["tax_term"]=trd["holding_days"].apply(lambda d:"LTCG (>1yr)" if d>365 else "STCG (<1yr)")
+                    trd=trd.dropna(subset=["buy_date","sell_date"]); trd=trd[trd["quantity"]>0]
+                    st.markdown(f"#### 📋 Preview — {len(trd)} trades")
+                    pv=trd.copy()
+                    for dc in ['buy_date','sell_date']: pv[dc]=pd.to_datetime(pv[dc],errors='coerce').dt.strftime("%d %b %Y")
+                    st.dataframe(pv[["share_name","quantity","buy_date","buy_price","sell_date","sell_price","realized_pnl","holding_days","tax_term"]].rename(columns={"share_name":"Company","quantity":"Qty","buy_date":"Buy","buy_price":"Buy ₹","sell_date":"Sell","sell_price":"Sell ₹","realized_pnl":"P&L","holding_days":"Days","tax_term":"Term"}).style.format({"Buy ₹":"₹{:,.2f}","Sell ₹":"₹{:,.2f}","P&L":"₹{:,.2f}"}).map(cpnl,subset=["P&L"]),use_container_width=True,height=240)
+                    if st.button("✅ Confirm & Load",use_container_width=True,key="cr"):
+                        st.session_state["rpt_trades"]=trd; st.success(f"✅ {len(trd)} trades loaded!"); st.rerun()
+            except Exception as e: st.error(f"Error: {e}")
         elif "rpt_trades" in st.session_state and not st.session_state["rpt_trades"].empty:
-            st.success(f"✅ {len(st.session_state['rpt_trades'])} trades already loaded. Switch to 📊 P&L Dashboard.")
+            st.success(f"✅ {len(st.session_state['rpt_trades'])} trades loaded. Switch to 📊 P&L Dashboard.")
 
-    with tx_tab2:
-        st.caption("Add individual BUY/SELL transactions manually for FIFO P&L tracking.")
-        with st.form("add_tx_form", clear_on_submit=True):
+    with tx_t3:
+        with st.form("tx_form",clear_on_submit=True):
             tc1,tc2=st.columns(2)
             with tc1:
-                tx_sn=st.text_input("Company Name",placeholder="e.g. Reliance Industries")
-                tx_tk=st.text_input("Yahoo Ticker (optional)",placeholder="e.g. RELIANCE.NS")
+                tx_sn=st.text_input("Company Name",placeholder="Reliance Industries")
+                tx_tk=st.text_input("Yahoo Ticker (optional)",placeholder="RELIANCE.NS")
                 tx_tp=st.radio("Type",["BUY","SELL"],horizontal=True)
             with tc2:
                 tx_dt=st.date_input("Date",value=now_ist().date())
                 tx_q=st.number_input("Quantity",min_value=0.0,step=1.0,format="%.2f")
-                tx_p=st.number_input("Price per share (₹)",min_value=0.0,step=0.01,format="%.2f")
-            if st.form_submit_button("💾 Add Transaction",use_container_width=True):
-                if not tx_sn or tx_q<=0 or tx_p<=0:
-                    st.error("⚠️ Fill Company Name, Quantity, and Price.")
+                tx_p=st.number_input("Price ₹",min_value=0.0,step=0.01,format="%.2f")
+            if st.form_submit_button("💾 Add",use_container_width=True):
+                if not tx_sn or tx_q<=0 or tx_p<=0: st.error("Fill Company, Qty, Price.")
                 else:
                     nr=pd.DataFrame([{"date":pd.to_datetime(tx_dt),"share_name":tx_sn.strip(),"ticker":tx_tk.strip().upper(),"txn_type":tx_tp,"quantity":tx_q,"price":tx_p}])
-                    st.session_state.transactions_df=append_transactions(nr)
+                    st.session_state.transactions=append_transactions(nr)
                     st.success(f"✅ {tx_tp} {tx_q} × {tx_sn} @ ₹{tx_p:,.2f}"); st.rerun()
 
-    with tx_tab3:
-        tx_df=st.session_state.transactions_df
-        if tx_df.empty:
-            st.info("💡 No manual transactions yet. Use ➕ Manual Entry tab.")
+    with tx_t4:
+        txdf=st.session_state.transactions
+        if txdf.empty: st.info("No manual transactions yet.")
         else:
-            st.markdown("#### 📜 Manual Transaction Ledger")
-            disp=tx_df.copy().sort_values('date',ascending=False)
-            disp['date']=pd.to_datetime(disp['date'],errors='coerce').dt.strftime('%d %b %Y')
-            st.dataframe(disp,use_container_width=True,height=260)
-            dl_col,cl_col=st.columns([3,1])
-            with dl_col: st.download_button("📥 Download CSV",data=tx_df.to_csv(index=False).encode('utf-8'),file_name="transaction_ledger.csv",mime="text/csv",use_container_width=True)
-            with cl_col:
-                if st.button("🗑️ Clear All",use_container_width=True):
-                    st.session_state.transactions_df=pd.DataFrame(columns=TX_COLUMNS); save_transactions(st.session_state.transactions_df); st.rerun()
-            st.markdown("---")
-            st.markdown("#### 💰 FIFO Realized P&L")
-            rd,old=compute_fifo_realized_pnl(tx_df)
-            if rd.empty:
-                st.info("No SELL transactions yet.")
-            else:
+            dp=txdf.copy().sort_values('date',ascending=False)
+            dp['date']=pd.to_datetime(dp['date'],errors='coerce').dt.strftime('%d %b %Y')
+            st.dataframe(dp,use_container_width=True,height=250)
+            c1,c2=st.columns([3,1])
+            with c1: st.download_button("📥 Download",data=txdf.to_csv(index=False).encode(),file_name="ledger.csv",mime="text/csv",use_container_width=True)
+            with c2:
+                if st.button("🗑️ Clear",use_container_width=True):
+                    st.session_state.transactions=pd.DataFrame(columns=TX_COLS); save_transactions(st.session_state.transactions); st.rerun()
+            rd,old=compute_fifo(txdf)
+            if not rd.empty:
                 tr=rd['realized_pnl'].sum(); sr_=rd[rd['tax_term'].str.contains('STCG')]['realized_pnl'].sum(); lr_=rd[rd['tax_term'].str.contains('LTCG')]['realized_pnl'].sum()
-                rc1,rc2,rc3=st.columns(3)
-                rc1.markdown(f'<div class="terminal-card"><div class="metric-title">TOTAL REALIZED P&L</div><div class="metric-value" style="color:{"#3fb950" if tr>=0 else "#f85149"};">₹{tr:,.2f}</div></div>', unsafe_allow_html=True)
-                rc2.markdown(f'<div class="terminal-card"><div class="metric-title">STCG P&L</div><div class="metric-value" style="color:#58a6ff;">₹{sr_:,.2f}</div></div>', unsafe_allow_html=True)
-                rc3.markdown(f'<div class="terminal-card"><div class="metric-title">LTCG P&L</div><div class="metric-value" style="color:#58a6ff;">₹{lr_:,.2f}</div></div>', unsafe_allow_html=True)
-            if not old.empty:
-                st.markdown("#### 📦 Open Lots")
-                ol=old.copy(); ol['buy_date']=pd.to_datetime(ol['buy_date']).dt.strftime('%d %b %Y')
-                st.dataframe(ol.rename(columns={'share_name':'Stock','buy_date':'Buy Date','quantity':'Qty','buy_price':'Buy ₹'}),use_container_width=True,height=200)
+                r1,r2,r3=st.columns(3)
+                r1.markdown(f'<div class="tc"><div class="mt">REALIZED P&L</div><div class="mv" style="color:{"#3fb950" if tr>=0 else "#f85149"};">₹{tr:,.2f}</div></div>',unsafe_allow_html=True)
+                r2.markdown(f'<div class="tc"><div class="mt">STCG</div><div class="mv" style="color:#58a6ff;">₹{sr_:,.2f}</div></div>',unsafe_allow_html=True)
+                r3.markdown(f'<div class="tc"><div class="mt">LTCG</div><div class="mv" style="color:#58a6ff;">₹{lr_:,.2f}</div></div>',unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════════
 # PORTFOLIO PAGES (require uploaded file)
 # ══════════════════════════════════════════════════════════════════════
 elif not df.empty:
     df.columns = df.columns.str.strip()
-    all_columns = list(df.columns)
-    saved_pm = st.session_state.saved_mappings.get("portfolio",{})
+    all_cols = list(df.columns)
+    spm = st.session_state.mappings.get("portfolio",{})
 
-    def _col_idx(sk, kws, fp=0):
-        if sk in saved_pm and saved_pm[sk] in all_columns: return all_columns.index(saved_pm[sk])
-        return next((i for i,c in enumerate(all_columns) if c.lower() in kws), fp)
+    def _ci(sk, kws, fp=0):
+        if sk in spm and spm[sk] in all_cols: return all_cols.index(spm[sk])
+        return next((i for i,c in enumerate(all_cols) if c.lower() in kws), fp)
 
-    pmap_notice = " ✅ (saved mapping)" if saved_pm else ""
-    st.markdown(f'<div class="map-box">🗺️ <b>Portfolio Column Mapping{pmap_notice}</b><br><small style="color:#8b949e;">Select columns and click Save Mapping — remembered for next time.</small></div>', unsafe_allow_html=True)
-
-    mc1,mc2,mc3,mc4 = st.columns([2,2,2,1])
-    with mc1: ticker_col = st.selectbox("🌐 Ticker/Company:",all_columns, index=_col_idx("ticker",[],0))
-    with mc2: qty_col    = st.selectbox("📦 Quantity:",all_columns,    index=_col_idx("qty",['quantity','qty','volume','shares'],0))
-    with mc3: price_col  = st.selectbox("💰 Buy Price:",all_columns,   index=_col_idx("price",['buy_price','buy price','avg_price','avg price','rate','price'],min(2,len(all_columns)-1)))
+    note=" ✅ (saved)" if spm else ""
+    st.markdown(f'<div class="mb-box">🗺️ <b>Portfolio Column Mapping{note}</b></div>', unsafe_allow_html=True)
+    mc1,mc2,mc3,mc4=st.columns([2,2,2,1])
+    with mc1: tc_=st.selectbox("🌐 Ticker/Company:",all_cols,index=_ci("ticker",[],0))
+    with mc2: qc_=st.selectbox("📦 Quantity:",all_cols,index=_ci("qty",['quantity','qty','volume','shares'],0))
+    with mc3: pc_=st.selectbox("💰 Buy Price:",all_cols,index=_ci("price",['buy_price','buy price','avg_price','avg price','rate','price'],min(2,len(all_cols)-1)))
     with mc4:
         st.markdown("<br>",unsafe_allow_html=True)
         if st.button("💾 Save",use_container_width=True):
-            pm=st.session_state.saved_mappings; pm["portfolio"]={"ticker":ticker_col,"qty":qty_col,"price":price_col}
-            save_mappings(pm); st.session_state.saved_mappings=pm; st.toast("✅ Portfolio mapping saved!",icon="💾")
-
+            pm=st.session_state.mappings; pm["portfolio"]={"ticker":tc_,"qty":qc_,"price":pc_}
+            save_mappings(pm); st.session_state.mappings=pm; st.toast("✅ Mapping saved!",icon="💾")
     st.markdown("---")
 
-    df = df.dropna(subset=[ticker_col])
-    df[ticker_col] = df[ticker_col].astype(str).str.strip()
-    df = df[(df[ticker_col]!='') & (~df[ticker_col].str.contains('Total|TOTAL|Grand',case=False,na=False))]
-    df['quantity']  = pd.to_numeric(df[qty_col],  errors='coerce').fillna(0)
-    df['buy_price'] = pd.to_numeric(df[price_col],errors='coerce').fillna(0)
-    df['Invested']  = df['quantity'] * df['buy_price']
-    df = df[df['Invested']>0].copy()
+    df=df.dropna(subset=[tc_])
+    df[tc_]=df[tc_].astype(str).str.strip()
+    df=df[(df[tc_]!='') & (~df[tc_].str.contains('Total|TOTAL|Grand',case=False,na=False))]
+    df['quantity']=pd.to_numeric(df[qc_],errors='coerce').fillna(0)
+    df['buy_price']=pd.to_numeric(df[pc_],errors='coerce').fillna(0)
+    df['Invested']=df['quantity']*df['buy_price']
+    df=df[df['Invested']>0].copy()
 
-    unique_tickers = df[ticker_col].unique().tolist()
-    manual_overrides_tuple = tuple(sorted(st.session_state.manual_ticker_overrides.items()))
-
+    uniq=df[tc_].unique().tolist()
+    ov_t=tuple(sorted(st.session_state.overrides.items()))
     with st.spinner('🔎 Resolving tickers…'):
-        ticker_resolution_map = resolve_tickers(tuple(unique_tickers), manual_overrides_tuple)
-    df['resolved_ticker'] = df[ticker_col].map(ticker_resolution_map)
+        trmap=resolve_tickers(tuple(uniq),ov_t)
+    df['resolved_ticker']=df[tc_].map(trmap)
+    unresolved=sorted({r for r,v in trmap.items() if not v})
+    resolved_t=sorted({t for t in trmap.values() if t})
 
-    unresolved_entries = sorted({raw for raw,res in ticker_resolution_map.items() if not res})
-    resolved_unique_tickers = sorted({t for t in ticker_resolution_map.values() if t})
+    with st.spinner('🗲 Fetching live prices…'):    prices=fetch_prices(tuple(resolved_t))
+    with st.spinner('📊 Fetching 52W range…'):     rng=fetch_52w(tuple(resolved_t))
 
-    with st.spinner('🗲 Fetching live prices…'):
-        live_prices_map = fetch_live_prices_from_yahoo(tuple(resolved_unique_tickers))
-    with st.spinner('📊 Fetching 52-week range…'):
-        range_map = fetch_52week_range(tuple(resolved_unique_tickers))
+    df['live_price']=df['resolved_ticker'].map(prices).fillna(0)
+    df['share_name']=df[tc_]
+    df['high_52w']=df['resolved_ticker'].map(lambda t: rng.get(t,(0,0))[0] if t else 0).fillna(0)
+    df['low_52w'] =df['resolved_ticker'].map(lambda t: rng.get(t,(0,0))[1] if t else 0).fillna(0)
 
-    df['live_price'] = df['resolved_ticker'].map(live_prices_map).fillna(0)
-    df['share_name'] = df[ticker_col]
-    df['high_52w'] = df['resolved_ticker'].map(lambda t: range_map.get(t,(0,0))[0] if t else 0).fillna(0)
-    df['low_52w']  = df['resolved_ticker'].map(lambda t: range_map.get(t,(0,0))[1] if t else 0).fillna(0)
-
-    if unresolved_entries:
-        st.markdown(f'<div class="risk-warning">⚠️ <b>No ticker found for {len(unresolved_entries)} compan(ies).</b> Type exact Yahoo tickers below and click Save.</div>', unsafe_allow_html=True)
-        with st.expander(f"✏️ Fix {len(unresolved_entries)} unresolved compan(ies)", expanded=True):
-            with st.form("fix_unresolved"):
-                fix_inputs = {}
-                for entry in unresolved_entries:
-                    c1,c2 = st.columns([3,2]); c1.write(entry)
-                    fix_inputs[entry] = c2.text_input("Yahoo ticker",key=f"fix_{entry}",placeholder="e.g. TATAMOTORS.NS",label_visibility="collapsed")
+    if unresolved:
+        st.markdown(f'<div class="rw">⚠️ <b>No ticker for {len(unresolved)} companies.</b> Fill below and click Save.</div>',unsafe_allow_html=True)
+        with st.expander(f"✏️ Fix {len(unresolved)} entries",expanded=True):
+            with st.form("fix_t"):
+                fi={}
+                for e in unresolved:
+                    c1,c2=st.columns([3,2]); c1.write(e)
+                    fi[e]=c2.text_input("Yahoo ticker",key=f"fx_{e}",placeholder="e.g. TATAMOTORS.NS",label_visibility="collapsed")
                 if st.form_submit_button("💾 Save All",use_container_width=True):
                     ns=0
-                    for e,tv in fix_inputs.items():
+                    for e,tv in fi.items():
                         tv=tv.strip()
-                        if tv: st.session_state.manual_ticker_overrides[e]=tv.upper(); ns+=1
+                        if tv: st.session_state.overrides[e]=tv.upper(); ns+=1
                     if ns>0:
-                        save_overrides(st.session_state.manual_ticker_overrides); st.cache_data.clear(); st.success(f"✅ Saved {ns} ticker(s)."); st.rerun()
-                    else:
-                        st.warning("Enter at least one ticker before saving.")
+                        save_overrides(st.session_state.overrides); st.cache_data.clear(); st.success(f"✅ Saved {ns}"); st.rerun()
 
-    df['Simulated_Live'] = df['live_price'] * (1 + market_shock/100)
-    df['Current']   = df['quantity'] * df['Simulated_Live']
-    df['PnL']       = df['Current'] - df['Invested']
-    df['Returns_Pct'] = (df['PnL'] / df['Invested']) * 100
-    df['Weight']    = (df['Invested'] / df['Invested'].sum()) * 100
-    df['Action']    = df.apply(lambda r: f"🎯 TAKE PROFIT (+{target_pct}%)" if r['Returns_Pct']>=target_pct else (f"⚠️ STOP LOSS ({stop_loss_pct}%)" if r['Returns_Pct']<=stop_loss_pct else "🟢 HOLD (Safe)"), axis=1)
-    df['Range_Status'] = df.apply(lambda r: "📈 AT 52W HIGH" if r['high_52w'] and r['live_price']>=r['high_52w'] else ("📉 AT 52W LOW" if r['low_52w'] and r['live_price']<=r['low_52w'] else ""), axis=1)
+    df['Simulated_Live']=df['live_price']*(1+market_shock/100)
+    df['Current']=df['quantity']*df['Simulated_Live']
+    df['PnL']=df['Current']-df['Invested']
+    df['Returns_Pct']=(df['PnL']/df['Invested'])*100
+    df['Weight']=(df['Invested']/df['Invested'].sum())*100
+    df['Action']=df.apply(lambda r: f"🎯 PROFIT (+{target_pct}%)" if r['Returns_Pct']>=target_pct else (f"⚠️ STOP ({stop_loss_pct}%)" if r['Returns_Pct']<=stop_loss_pct else "🟢 HOLD"), axis=1)
+    df['Range_Status']=df.apply(lambda r: "📈 AT 52W HIGH" if r['high_52w'] and r['live_price']>=r['high_52w'] else ("📉 AT 52W LOW" if r['low_52w'] and r['live_price']<=r['low_52w'] else ""), axis=1)
 
-    total_invested = df['Invested'].sum(); total_current = df['Current'].sum()
-    total_pnl = df['PnL'].sum(); weighted_return = (total_pnl/total_invested*100) if total_invested>0 else 0
-    total_stocks = len(df); profit_stocks = (df['PnL']>0).sum()
-    win_rate = (profit_stocks/total_stocks*100) if total_stocks>0 else 0
-    high_risk_stocks = df[df['Weight']>25]
+    ti=df['Invested'].sum(); tc_v=df['Current'].sum(); tp=df['PnL'].sum()
+    wr_=(tp/ti*100) if ti>0 else 0; ns=len(df); ps=(df['PnL']>0).sum()
+    wr2=(ps/ns*100) if ns>0 else 0
+    append_history_snap(ti,tc_v,tp)
 
-    append_history_snapshot(total_invested, total_current, total_pnl)
-
-    # ── Alert checks (every refresh) ──────────────────────────────────
-    _cfg = st.session_state.app_settings
-    check_52week_alerts(df, st.session_state.alerted_keys, _cfg)
-    triggered_price = check_price_alerts(live_prices_map, st.session_state.alerted_keys, _cfg)
-    for ticker,label,live,threshold in triggered_price:
-        st.toast(f"🔔 {ticker}: {label} @ ₹{live:,.2f}", icon="🔔")
-
-    # ── 52W banners ────────────────────────────────────────────────────
+    # Alert checks
     for _,row in df[df['Range_Status']!=""].iterrows():
-        css = "alert-box-high" if "HIGH" in row['Range_Status'] else "alert-box-low"
-        st.markdown(f'<div class="{css}">{row["Range_Status"]}: <b>{row["share_name"]}</b> ₹{row["live_price"]:,.2f}</div>', unsafe_allow_html=True)
+        dispatch(f"{row['Range_Status']}: {row['share_name']} ₹{row['live_price']:,.2f}",
+                 f"{row['share_name']} has touched {row['Range_Status']} at ₹{row['live_price']:,.2f}", _cfg)
+    # 52W banners
+    for _,row in df[df['Range_Status']!=""].iterrows():
+        st.markdown(f'<div class="{"ah" if "HIGH" in row["Range_Status"] else "al"}">{row["Range_Status"]}: <b>{row["share_name"]}</b> ₹{row["live_price"]:,.2f}</div>',unsafe_allow_html=True)
 
-    df_filtered = df.copy()
-    if stock_filter == "🟢 Profit Only":   df_filtered = df[df['PnL']>0]
-    elif stock_filter == "🔴 Loss Only":   df_filtered = df[df['PnL']<=0]
+    df_f=df.copy()
+    if stock_filter=="🟢 Profit Only":   df_f=df[df['PnL']>0]
+    elif stock_filter=="🔴 Loss Only":   df_f=df[df['PnL']<=0]
 
-    # ════════════════ OVERVIEW ════════════════════════════════════════
+    # ═══ OVERVIEW ════════════════════════════════════════════════════
     if "Overview" in menu or "🖥️" in menu:
-        st.caption(f"🔄 Auto-refreshes every 1 second | Last refreshed: {now_ist().strftime('%H:%M:%S')} IST")
+        st.caption(f"🔄 Auto-refresh 1s | {now_ist().strftime('%H:%M:%S')} IST" + (f" | ⚠️ Stress: {market_shock:+.0f}%" if market_shock!=0 else ""))
+        for _,row in df[df['Weight']>25].iterrows():
+            st.markdown(f'<div class="rw">⚠️ <b>Concentration:</b> {row["Weight"]:.1f}% in <b>{row["share_name"]}</b></div>',unsafe_allow_html=True)
 
-        if market_shock != 0:
-            st.info(f"⚠️ Simulation Mode: {market_shock:+.0f}% market change applied.")
+        bench_ret,bench_hist=fetch_benchmark("1y")
+        sc_=scorecard(df,bench_ret)
 
-        for _,row in high_risk_stocks.iterrows():
-            st.markdown(f'<div class="risk-warning">⚠️ <b>Concentration Risk:</b> {row["Weight"]:.1f}% of capital in <b>{row["share_name"]}</b></div>', unsafe_allow_html=True)
-
-        # ── ★ PORTFOLIO SCORECARD ────────────────────────────────────
-        bench_ret, bench_hist = fetch_benchmark_returns("1y")
-        sc_data = build_scorecard(df, bench_ret)
-
-        st.markdown(f"""
-        <div style='background:linear-gradient(135deg,#161b22,#1c2128);border:1px solid #30363d;border-radius:12px;padding:18px 24px;margin-bottom:18px;'>
-        <div style='display:flex;align-items:center;gap:16px;margin-bottom:14px;'>
-            <div style='font-size:40px;font-weight:900;color:{sc_data["color"]};font-family:monospace;'>{sc_data["score"]}</div>
-            <div>
-                <div style='font-size:11px;color:#8b949e;font-weight:700;text-transform:uppercase;letter-spacing:1px;'>PORTFOLIO HEALTH SCORE / 100</div>
-                <div style='font-size:18px;color:{sc_data["color"]};font-weight:700;'>{sc_data["label"]}</div>
-            </div>
+        # Scorecard banner
+        alpha_html=""
+        if sc_["alpha"] is not None:
+            ac="#3fb950" if sc_["alpha"]>=0 else "#f85149"
+            alpha_html=f'<div style="flex:1;min-width:130px;background:#1c2128;border:1px solid #30363d;border-radius:8px;padding:10px 14px;"><div style="font-size:9px;color:#8b949e;font-weight:700;text-transform:uppercase;">Alpha vs Nifty</div><div style="font-size:18px;font-weight:700;color:{ac};font-family:monospace;">{sc_["alpha"]:+.2f}%</div></div>'
+        st.markdown(f"""<div style='background:linear-gradient(135deg,#161b22,#1c2128);border:1px solid #30363d;border-radius:12px;padding:16px 20px;margin-bottom:16px;'>
+        <div style='display:flex;align-items:center;gap:14px;margin-bottom:12px;'>
+          <div style='font-size:38px;font-weight:900;color:{sc_["color"]};font-family:monospace;'>{sc_["score"]}</div>
+          <div><div style='font-size:10px;color:#8b949e;font-weight:700;text-transform:uppercase;'>HEALTH SCORE / 100</div>
+          <div style='font-size:16px;color:{sc_["color"]};font-weight:700;'>{sc_["label"]}</div></div>
         </div>
-        <div class="scorecard-row">
-            <div class="scorecard-item"><div class="scorecard-label">Stocks Held</div><div class="scorecard-val" style="color:#58a6ff;">{sc_data["n_stocks"]}</div></div>
-            <div class="scorecard-item"><div class="scorecard-label">Win Rate</div><div class="scorecard-val" style="color:{'#3fb950' if sc_data['win_rate']>=50 else '#f85149'};">{sc_data["win_rate"]:.1f}%</div></div>
-            <div class="scorecard-item"><div class="scorecard-label">Max Weight</div><div class="scorecard-val" style="color:{'#f85149' if sc_data['max_weight']>25 else '#3fb950'};">{sc_data["max_weight"]:.1f}%</div></div>
-            <div class="scorecard-item"><div class="scorecard-label">Overall Return</div><div class="scorecard-val" style="color:{'#3fb950' if sc_data['overall_ret']>=0 else '#f85149'};">{sc_data["overall_ret"]:+.2f}%</div></div>
-            <div class="scorecard-item"><div class="scorecard-label">Sharpe Ratio</div><div class="scorecard-val" style="color:{'#3fb950' if sc_data['sharpe']>0.5 else '#e3b341'};">{sc_data["sharpe"]:.2f}</div></div>
-            <div class="scorecard-item"><div class="scorecard-label">Max Drawdown</div><div class="scorecard-val" style="color:#f85149;">{sc_data["max_dd"]:+.1f}%</div></div>
-            <div class="scorecard-item"><div class="scorecard-label">Volatility (std%)</div><div class="scorecard-val" style="color:#e3b341;">{sc_data["volatility"]:.1f}%</div></div>
-            {'<div class="scorecard-item"><div class="scorecard-label">Alpha vs Nifty</div><div class="scorecard-val" style="color:' + ("#3fb950" if sc_data["alpha"] and sc_data["alpha"]>=0 else "#f85149") + ';">' + (f'{sc_data["alpha"]:+.2f}%' if sc_data["alpha"] is not None else "N/A") + '</div></div>' if sc_data["alpha"] is not None else ""}
+        <div style='display:flex;gap:10px;flex-wrap:wrap;'>
+          <div style='flex:1;min-width:130px;background:#1c2128;border:1px solid #30363d;border-radius:8px;padding:10px 14px;'><div style='font-size:9px;color:#8b949e;font-weight:700;text-transform:uppercase;'>Stocks</div><div style='font-size:18px;font-weight:700;color:#58a6ff;font-family:monospace;'>{sc_["n"]}</div></div>
+          <div style='flex:1;min-width:130px;background:#1c2128;border:1px solid #30363d;border-radius:8px;padding:10px 14px;'><div style='font-size:9px;color:#8b949e;font-weight:700;text-transform:uppercase;'>Win Rate</div><div style='font-size:18px;font-weight:700;color:{"#3fb950" if sc_["wr"]>=50 else "#f85149"};font-family:monospace;'>{sc_["wr"]:.1f}%</div></div>
+          <div style='flex:1;min-width:130px;background:#1c2128;border:1px solid #30363d;border-radius:8px;padding:10px 14px;'><div style='font-size:9px;color:#8b949e;font-weight:700;text-transform:uppercase;'>Return</div><div style='font-size:18px;font-weight:700;color:{"#3fb950" if sc_["ret"]>=0 else "#f85149"};font-family:monospace;'>{sc_["ret"]:+.2f}%</div></div>
+          <div style='flex:1;min-width:130px;background:#1c2128;border:1px solid #30363d;border-radius:8px;padding:10px 14px;'><div style='font-size:9px;color:#8b949e;font-weight:700;text-transform:uppercase;'>Sharpe</div><div style='font-size:18px;font-weight:700;color:{"#3fb950" if sc_["sharpe"]>0.5 else "#e3b341"};font-family:monospace;'>{sc_["sharpe"]:.2f}</div></div>
+          <div style='flex:1;min-width:130px;background:#1c2128;border:1px solid #30363d;border-radius:8px;padding:10px 14px;'><div style='font-size:9px;color:#8b949e;font-weight:700;text-transform:uppercase;'>Max DD</div><div style='font-size:18px;font-weight:700;color:#f85149;font-family:monospace;'>{sc_["mdd"]:+.1f}%</div></div>
+          {alpha_html}
         </div></div>""", unsafe_allow_html=True)
 
-        # ── XIRR ─────────────────────────────────────────────────────
-        xirr_value = None
-        tx_xirr = st.session_state.get("transactions_df", pd.DataFrame())
-        if not tx_xirr.empty:
+        # XIRR
+        xv=None
+        txd=st.session_state.transactions
+        if not txd.empty:
             try:
-                cfs = [(r['date'].to_pydatetime() if hasattr(r['date'],'to_pydatetime') else r['date'],
-                        -(r['quantity']*r['price']) if str(r['txn_type']).upper()=='BUY' else (r['quantity']*r['price']))
-                       for _,r in tx_xirr.iterrows()]
-                cfs.append((now_ist().replace(tzinfo=None), total_current))
-                xirr_value = calculate_xirr(cfs)
-            except Exception:
-                pass
+                cfs=[(r['date'].to_pydatetime() if hasattr(r['date'],'to_pydatetime') else r['date'],
+                      -(r['quantity']*r['price']) if str(r['txn_type']).upper()=='BUY' else (r['quantity']*r['price']))
+                     for _,r in txd.iterrows()]
+                cfs.append((now_ist().replace(tzinfo=None),tc_v))
+                xv=xirr(cfs)
+            except: pass
 
-        st.markdown("<h4 style='color:#e6edf3;margin:10px 0;'>📈 Terminal Performance Matrix</h4>", unsafe_allow_html=True)
-        k1,k2,k3,k4,k5,k6 = st.columns(6)
-        k1.markdown(f'<div class="terminal-card"><div class="metric-title">TOTAL INVESTED</div><div class="metric-value">₹{total_invested:,.0f}</div><div class="metric-status-blue">● Net Asset Base</div></div>', unsafe_allow_html=True)
-        k2.markdown(f'<div class="terminal-card"><div class="metric-title">CURRENT VALUE</div><div class="metric-value">₹{total_current:,.0f}</div><div class="metric-status-blue">Yahoo Live</div></div>', unsafe_allow_html=True)
-        pc=("#3fb950" if total_pnl>=0 else "#f85149")
-        k3.markdown(f'<div class="terminal-card"><div class="metric-title">UNREALIZED P&L</div><div class="metric-value" style="color:{pc};">{"+" if total_pnl>=0 else ""}₹{total_pnl:,.0f}</div><div class="metric-status-blue">{weighted_return:+.2f}%</div></div>', unsafe_allow_html=True)
-        k4.markdown(f'<div class="terminal-card"><div class="metric-title">WIN RATE</div><div class="metric-value" style="color:#58a6ff;">{win_rate:.1f}%</div><div class="metric-status-blue">{profit_stocks}G / {total_stocks-profit_stocks}L</div></div>', unsafe_allow_html=True)
-        if xirr_value is not None:
-            xc = "#3fb950" if xirr_value>=0 else "#f85149"
-            k5.markdown(f'<div class="terminal-card"><div class="metric-title">XIRR</div><div class="metric-value" style="color:{xc};">{xirr_value:.2f}%</div><div class="metric-status-blue">Annualized</div></div>', unsafe_allow_html=True)
+        st.markdown("<h4 style='color:#e6edf3;margin:8px 0;'>📈 Performance Matrix</h4>",unsafe_allow_html=True)
+        k1,k2,k3,k4,k5,k6=st.columns(6)
+        k1.markdown(f'<div class="tc"><div class="mt">INVESTED</div><div class="mv">₹{ti:,.0f}</div><div class="mb">● Base</div></div>',unsafe_allow_html=True)
+        k2.markdown(f'<div class="tc"><div class="mt">CURRENT VALUE</div><div class="mv">₹{tc_v:,.0f}</div><div class="mb">Live</div></div>',unsafe_allow_html=True)
+        pc=("#3fb950" if tp>=0 else "#f85149")
+        k3.markdown(f'<div class="tc"><div class="mt">UNREALIZED P&L</div><div class="mv" style="color:{pc};">{"+" if tp>=0 else ""}₹{tp:,.0f}</div><div class="mb">{wr_:+.2f}%</div></div>',unsafe_allow_html=True)
+        k4.markdown(f'<div class="tc"><div class="mt">WIN RATE</div><div class="mv" style="color:#58a6ff;">{wr2:.1f}%</div><div class="mb">{ps}G / {ns-ps}L</div></div>',unsafe_allow_html=True)
+        if xv is not None:
+            xc="#3fb950" if xv>=0 else "#f85149"
+            k5.markdown(f'<div class="tc"><div class="mt">XIRR</div><div class="mv" style="color:{xc};">{xv:.2f}%</div><div class="mb">Annualized</div></div>',unsafe_allow_html=True)
         else:
-            k5.markdown(f'<div class="terminal-card"><div class="metric-title">XIRR</div><div class="metric-value" style="color:#8b949e;font-size:13px;">Add trades in Ledger</div></div>', unsafe_allow_html=True)
-        k6.markdown(f'<div class="terminal-card"><div class="metric-title">HEALTH SCORE</div><div class="metric-value" style="color:{sc_data["color"]};">{sc_data["score"]}/100</div><div class="metric-status-blue">{sc_data["label"]}</div></div>', unsafe_allow_html=True)
+            k5.markdown(f'<div class="tc"><div class="mt">XIRR</div><div class="mv" style="color:#8b949e;font-size:12px;">Add in Ledger</div></div>',unsafe_allow_html=True)
+        k6.markdown(f'<div class="tc"><div class="mt">HEALTH</div><div class="mv" style="color:{sc_["color"]};">{sc_["score"]}/100</div><div class="mb">{sc_["label"][:12]}</div></div>',unsafe_allow_html=True)
 
-        if not df_filtered.empty:
-            col_left,col_right = st.columns([3,2])
-            with col_left:
-                st.markdown("<h4>📊 Stock P&L Impact</h4>", unsafe_allow_html=True)
-                df_bar=df_filtered.groupby('share_name',as_index=False).agg({'PnL':'sum'}).sort_values('PnL')
-                fig_bar=go.Figure(go.Bar(x=df_bar['share_name'],y=df_bar['PnL'],marker_color=['#3fb950' if v>=0 else '#f85149' for v in df_bar['PnL']],text=df_bar['PnL'].apply(lambda x:f"₹{x:,.0f}"),textposition='auto'))
-                fig_bar.update_layout(plot_bgcolor='#161b22',paper_bgcolor='#0d1117',font=dict(color='#8b949e'),margin=dict(l=10,r=10,t=10,b=10),xaxis=dict(showgrid=False,tickangle=-45),yaxis=dict(gridcolor='#21262d'))
-                st.plotly_chart(fig_bar, use_container_width=True)
-            with col_right:
-                st.markdown("<h4>📦 Asset Allocation</h4>", unsafe_allow_html=True)
-                df_pie=df_filtered.groupby('share_name',as_index=False)['Invested'].sum()
-                fig_pie=go.Figure(go.Pie(labels=df_pie['share_name'],values=df_pie['Invested'],hole=.55,hoverinfo="label+percent+value",textinfo="none"))
-                fig_pie.update_layout(plot_bgcolor='#161b22',paper_bgcolor='#0d1117',font=dict(color='#8b949e'),margin=dict(l=10,r=10,t=10,b=10),legend=dict(orientation="h",y=-0.15))
-                st.plotly_chart(fig_pie, use_container_width=True)
+        if not df_f.empty:
+            cl,cr=st.columns([3,2])
+            with cl:
+                st.markdown("<h4>📊 Stock P&L</h4>",unsafe_allow_html=True)
+                db=df_f.groupby('share_name',as_index=False).agg({'PnL':'sum'}).sort_values('PnL')
+                fig_b=go.Figure(go.Bar(x=db['share_name'],y=db['PnL'],marker_color=['#3fb950' if v>=0 else '#f85149' for v in db['PnL']],text=db['PnL'].apply(lambda x:f"₹{x:,.0f}"),textposition='auto'))
+                fig_b.update_layout(plot_bgcolor='#161b22',paper_bgcolor='#0d1117',font=dict(color='#8b949e'),margin=dict(l=10,r=10,t=10,b=10),xaxis=dict(showgrid=False,tickangle=-45),yaxis=dict(gridcolor='#21262d'))
+                st.plotly_chart(fig_b,use_container_width=True)
+            with cr:
+                st.markdown("<h4>📦 Allocation</h4>",unsafe_allow_html=True)
+                dp_=df_f.groupby('share_name',as_index=False)['Invested'].sum()
+                fig_p=go.Figure(go.Pie(labels=dp_['share_name'],values=dp_['Invested'],hole=.55,hoverinfo="label+percent+value",textinfo="none"))
+                fig_p.update_layout(plot_bgcolor='#161b22',paper_bgcolor='#0d1117',font=dict(color='#8b949e'),margin=dict(l=10,r=10,t=10,b=10),legend=dict(orientation="h",y=-0.15))
+                st.plotly_chart(fig_p,use_container_width=True)
 
-            # ── ★ BENCHMARK COMPARISON ───────────────────────────────
+            # Benchmark comparison
             st.markdown("---")
             st.markdown("#### 📊 Portfolio vs Nifty 50 Benchmark")
-            if bench_ret is not None and not bench_hist.empty:
-                bc1,bc2,bc3 = st.columns(3)
-                alpha_val = sc_data.get("alpha")
-                bc1.markdown(f'<div class="terminal-card"><div class="metric-title">YOUR PORTFOLIO RETURN</div><div class="metric-value" style="color:{"#3fb950" if weighted_return>=0 else "#f85149"};">{weighted_return:+.2f}%</div></div>', unsafe_allow_html=True)
-                bc2.markdown(f'<div class="terminal-card"><div class="metric-title">NIFTY 50 RETURN (1Y)</div><div class="metric-value" style="color:{"#3fb950" if bench_ret>=0 else "#f85149"};">{bench_ret:+.2f}%</div></div>', unsafe_allow_html=True)
-                alpha_color = "#3fb950" if alpha_val and alpha_val>=0 else "#f85149"
-                alpha_txt = f"{alpha_val:+.2f}%" if alpha_val is not None else "N/A"
-                bc3.markdown(f'<div class="terminal-card"><div class="metric-title">ALPHA (Your Return − Nifty)</div><div class="metric-value" style="color:{alpha_color};">{alpha_txt}</div></div>', unsafe_allow_html=True)
+            if bench_ret is not None:
+                bc1,bc2,bc3=st.columns(3)
+                bc1.markdown(f'<div class="tc"><div class="mt">YOUR RETURN</div><div class="mv" style="color:{"#3fb950" if wr_>=0 else "#f85149"};">{wr_:+.2f}%</div></div>',unsafe_allow_html=True)
+                bc2.markdown(f'<div class="tc"><div class="mt">NIFTY 50 (1Y)</div><div class="mv" style="color:{"#3fb950" if bench_ret>=0 else "#f85149"};">{bench_ret:+.2f}%</div></div>',unsafe_allow_html=True)
+                alp=(wr_-bench_ret)
+                bc3.markdown(f'<div class="tc"><div class="mt">ALPHA</div><div class="mv" style="color:{"#3fb950" if alp>=0 else "#f85149"};">{alp:+.2f}%</div></div>',unsafe_allow_html=True)
 
-                # Normalised comparison chart (base 100)
-                nifty_series = bench_hist['Close'] / bench_hist['Close'].iloc[0] * 100
-                fig_bm = go.Figure()
-                fig_bm.add_trace(go.Scatter(x=bench_hist.index, y=nifty_series, name="NIFTY 50", line=dict(color="#e3b341", width=2)))
-                # Portfolio normalised line from history
-                hist_data_bm = load_history()
-                if len(hist_data_bm) >= 2:
-                    port_norm = hist_data_bm['total_current'] / hist_data_bm['total_current'].iloc[0] * 100
-                    fig_bm.add_trace(go.Scatter(x=hist_data_bm['date'], y=port_norm, name="Your Portfolio", line=dict(color="#58a6ff", width=2)))
-                fig_bm.add_hline(y=100, line_dash="dot", line_color="#8b949e", annotation_text="Start (base 100)")
-                fig_bm.update_layout(plot_bgcolor='#161b22',paper_bgcolor='#0d1117',font=dict(color='#8b949e'),margin=dict(l=10,r=10,t=20,b=10),xaxis=dict(gridcolor='#21262d'),yaxis=dict(gridcolor='#21262d',title="Normalised (base 100)"),legend=dict(orientation="h",y=-0.2))
-                st.plotly_chart(fig_bm, use_container_width=True)
-                st.caption("Portfolio trend requires multiple days of data. Nifty comparison shown immediately.")
-            else:
-                st.info("Benchmark data temporarily unavailable.")
-
-            # ── 52W Position Meter ────────────────────────────────────
+            # 52W meter
             st.markdown("---")
-            st.markdown("#### 📏 52-Week Price Position Meter")
-            df_52=df_filtered[df_filtered['high_52w']>0].copy()
-            df_52=df_52.groupby('share_name').agg({'live_price':'last','high_52w':'last','low_52w':'last','PnL':'sum'}).reset_index()
-            df_52=df_52[df_52['high_52w']>df_52['low_52w']].copy()
-            df_52['position_pct']=((df_52['live_price']-df_52['low_52w'])/(df_52['high_52w']-df_52['low_52w'])*100).clip(0,100)
-            for _,r52 in df_52.sort_values('position_pct').head(20).iterrows():
-                pos=r52['position_pct']; bc="#f85149" if pos<30 else ("#e3b341" if pos<60 else "#3fb950")
-                ns=r52['share_name'][:28]+"…" if len(r52['share_name'])>30 else r52['share_name']
-                st.markdown(f"""<div style='margin-bottom:6px;'>
-                  <div style='display:flex;justify-content:space-between;font-size:12px;color:#8b949e;margin-bottom:2px;'>
-                    <span><b style='color:#e6edf3;'>{ns}</b> ₹{r52['live_price']:,.2f}</span>
-                    <span>52W: ₹{r52['low_52w']:,.0f}—₹{r52['high_52w']:,.0f} <b style='color:{"#3fb950" if r52["PnL"]>=0 else "#f85149"};'>₹{r52["PnL"]:+,.0f}</b></span>
-                  </div>
-                  <div style='background:#21262d;border-radius:4px;height:10px;position:relative;'>
-                    <div style='width:{pos:.1f}%;background:{bc};border-radius:4px;height:10px;'></div>
-                    <div style='position:absolute;left:{pos:.1f}%;top:-2px;width:3px;height:14px;background:#fff;border-radius:2px;'></div>
-                  </div></div>""", unsafe_allow_html=True)
+            st.markdown("#### 📏 52-Week Position Meter")
+            df52=df_f[df_f['high_52w']>0].groupby('share_name').agg({'live_price':'last','high_52w':'last','low_52w':'last','PnL':'sum'}).reset_index()
+            df52=df52[df52['high_52w']>df52['low_52w']].copy()
+            df52['pos']=((df52['live_price']-df52['low_52w'])/(df52['high_52w']-df52['low_52w'])*100).clip(0,100)
+            for _,r in df52.sort_values('pos').head(20).iterrows():
+                pos=r['pos']; bc="#f85149" if pos<30 else ("#e3b341" if pos<60 else "#3fb950")
+                ns_=r['share_name'][:27]+"…" if len(r['share_name'])>29 else r['share_name']
+                st.markdown(f"""<div style='margin-bottom:5px;'>
+                <div style='display:flex;justify-content:space-between;font-size:11px;color:#8b949e;margin-bottom:2px;'>
+                  <span><b style='color:#e6edf3;'>{ns_}</b> ₹{r['live_price']:,.2f}</span>
+                  <span>52W: ₹{r['low_52w']:,.0f}—₹{r['high_52w']:,.0f} <b style='color:{"#3fb950" if r["PnL"]>=0 else "#f85149"};'>₹{r["PnL"]:+,.0f}</b></span>
+                </div>
+                <div style='background:#21262d;border-radius:4px;height:9px;position:relative;'>
+                  <div style='width:{pos:.1f}%;background:{bc};border-radius:4px;height:9px;'></div>
+                  <div style='position:absolute;left:{pos:.1f}%;top:-2px;width:2px;height:13px;background:#fff;border-radius:2px;'></div>
+                </div></div>""", unsafe_allow_html=True)
 
-            # ── Sector + History ──────────────────────────────────────
+            # Sector + History
             st.markdown("---")
-            col_sec,col_hist = st.columns([2,3])
-            with col_sec:
-                st.markdown("<h4>🏭 Sector Allocation</h4>", unsafe_allow_html=True)
-                with st.spinner("Fetching sector…"):
-                    sm = fetch_sector_info(tuple(resolved_unique_tickers))
-                df_sec=df_filtered.copy(); df_sec['Sector']=df_sec['resolved_ticker'].map(sm).fillna('Unknown')
-                sg=df_sec.groupby('Sector',as_index=False)['Invested'].sum().sort_values('Invested',ascending=False)
+            cs,ch_=st.columns([2,3])
+            with cs:
+                st.markdown("<h4>🏭 Sector Allocation</h4>",unsafe_allow_html=True)
+                with st.spinner("Fetching sectors…"):
+                    sm=fetch_sectors(tuple(resolved_t))
+                df_s=df_f.copy(); df_s['Sector']=df_s['resolved_ticker'].map(sm).fillna('Unknown')
+                sg=df_s.groupby('Sector',as_index=False)['Invested'].sum().sort_values('Invested',ascending=False)
                 fig_sec=go.Figure(go.Pie(labels=sg['Sector'],values=sg['Invested'],hole=.5,hoverinfo="label+percent+value",textinfo="percent"))
                 fig_sec.update_layout(plot_bgcolor='#161b22',paper_bgcolor='#0d1117',font=dict(color='#8b949e'),margin=dict(l=10,r=10,t=10,b=10),legend=dict(orientation="h",y=-0.2))
-                st.plotly_chart(fig_sec, use_container_width=True)
-            with col_hist:
-                st.markdown("<h4>📈 Portfolio Value Trend</h4>", unsafe_allow_html=True)
+                st.plotly_chart(fig_sec,use_container_width=True)
+            with ch_:
+                st.markdown("<h4>📈 Portfolio Value Trend</h4>",unsafe_allow_html=True)
                 hd=load_history()
-                if len(hd)<2:
-                    st.info("📊 Trend builds up day by day. Check back tomorrow!")
+                if len(hd)<2: st.info("📊 Trend builds day by day. Check back tomorrow!")
                 else:
                     fig_h=go.Figure()
-                    fig_h.add_trace(go.Scatter(x=hd['date'],y=hd['total_current'],name='Current Value',line=dict(color='#58a6ff'),fill='tozeroy',fillcolor='rgba(88,166,255,0.06)'))
+                    fig_h.add_trace(go.Scatter(x=hd['date'],y=hd['total_current'],name='Current',line=dict(color='#58a6ff'),fill='tozeroy',fillcolor='rgba(88,166,255,0.06)'))
                     fig_h.add_trace(go.Scatter(x=hd['date'],y=hd['total_invested'],name='Invested',line=dict(color='#8b949e',dash='dot')))
                     fig_h.update_layout(plot_bgcolor='#161b22',paper_bgcolor='#0d1117',font=dict(color='#8b949e'),margin=dict(l=10,r=10,t=10,b=10),xaxis=dict(gridcolor='#21262d'),yaxis=dict(gridcolor='#21262d',title='₹'),legend=dict(orientation="h",y=-0.2))
-                    st.plotly_chart(fig_h, use_container_width=True)
+                    st.plotly_chart(fig_h,use_container_width=True)
 
-            # ── Live Positions Table ──────────────────────────────────
-            st.markdown("---"); st.markdown("<h4>📋 Live Positions</h4>", unsafe_allow_html=True)
-            df_disp=df_filtered.copy()
-            df_disp['From 52W Low']  = ((df_disp['Simulated_Live']-df_disp['low_52w'])/df_disp['low_52w'].replace(0,1)*100)
-            df_disp['From 52W High'] = ((df_disp['Simulated_Live']-df_disp['high_52w'])/df_disp['high_52w'].replace(0,1)*100)
-            display_df=df_disp[['share_name','resolved_ticker','quantity','buy_price','Simulated_Live','high_52w','low_52w','From 52W Low','From 52W High','Invested','Current','PnL','Returns_Pct','Action']].copy()
-            display_df.columns=['Stock','Yahoo Ticker','Qty','Buy ₹','Live ₹','52W High','52W Low','↑ from Low%','↓ from High%','Invested','Current','P&L (₹)','Return%','Signal']
-            st.dataframe(display_df.style.format({'Buy ₹':'₹{:,.2f}','Live ₹':'₹{:,.2f}','52W High':'₹{:,.2f}','52W Low':'₹{:,.2f}','↑ from Low%':'{:+.1f}%','↓ from High%':'{:+.1f}%','Invested':'₹{:,.0f}','Current':'₹{:,.0f}','P&L (₹)':'₹{:,.2f}','Return%':'{:+.2f}%'}).map(color_pnl,subset=['P&L (₹)','Return%']),use_container_width=True,height=380)
+            # Live Positions Table
+            st.markdown("---")
+            st.markdown("<h4>📋 Live Positions</h4>",unsafe_allow_html=True)
+            ddi=df_f.copy()
+            ddi['↑ from Low%']=((ddi['Simulated_Live']-ddi['low_52w'])/ddi['low_52w'].replace(0,1)*100)
+            ddi['↓ from High%']=((ddi['Simulated_Live']-ddi['high_52w'])/ddi['high_52w'].replace(0,1)*100)
+            dd=ddi[['share_name','resolved_ticker','quantity','buy_price','Simulated_Live','high_52w','low_52w','↑ from Low%','↓ from High%','Invested','Current','PnL','Returns_Pct','Action']].copy()
+            dd.columns=['Stock','Ticker','Qty','Buy ₹','Live ₹','52W H','52W L','↑Low%','↓High%','Invested','Current','P&L','Ret%','Signal']
+            st.dataframe(dd.style.format({'Buy ₹':'₹{:,.2f}','Live ₹':'₹{:,.2f}','52W H':'₹{:,.2f}','52W L':'₹{:,.2f}','↑Low%':'{:+.1f}%','↓High%':'{:+.1f}%','Invested':'₹{:,.0f}','Current':'₹{:,.0f}','P&L':'₹{:,.2f}','Ret%':'{:+.2f}%'}).map(cpnl,subset=['P&L','Ret%']),use_container_width=True,height=380)
 
-            # ── Top 5 + Drawdown ─────────────────────────────────────
-            st.markdown("---"); t5c1,t5c2=st.columns(2)
-            with t5c1:
+            # Top5 + Drawdown
+            st.markdown("---")
+            t1,t2=st.columns(2)
+            with t1:
                 st.markdown("#### 🏆 Top 5 by Weight")
-                top5=df_filtered.groupby('share_name',as_index=False).agg({'Invested':'sum','Current':'sum','PnL':'sum','Weight':'sum'}).nlargest(5,'Weight')
-                top5['Return%']=(top5['PnL']/top5['Invested']*100)
-                st.dataframe(top5[['share_name','Weight','Invested','Current','PnL','Return%']].rename(columns={'share_name':'Stock','Weight':'Weight%','Invested':'Invested ₹','Current':'Current ₹','PnL':'P&L ₹'}).style.format({'Weight%':'{:.1f}%','Invested ₹':'₹{:,.0f}','Current ₹':'₹{:,.0f}','P&L ₹':'₹{:,.0f}','Return%':'{:+.1f}%'}).map(color_pnl,subset=['P&L ₹','Return%']),use_container_width=True,height=220)
-            with t5c2:
-                st.markdown("#### 📉 Drawdown from Buy Price")
-                df_dd=df_filtered.copy(); df_dd['Drawdown%']=((df_dd['Simulated_Live']-df_dd['buy_price'])/df_dd['buy_price'].replace(0,1)*100)
-                ddg=df_dd.groupby('share_name',as_index=False).agg({'Drawdown%':'mean'}).sort_values('Drawdown%').head(10)
-                fig_dd=go.Figure(go.Bar(x=ddg['Drawdown%'],y=ddg['share_name'],orientation='h',marker_color=['#f85149' if v<0 else '#3fb950' for v in ddg['Drawdown%']],text=ddg['Drawdown%'].apply(lambda v:f"{v:+.1f}%"),textposition='auto'))
-                fig_dd.update_layout(plot_bgcolor='#161b22',paper_bgcolor='#0d1117',font=dict(color='#8b949e'),margin=dict(l=10,r=10,t=10,b=10),xaxis=dict(gridcolor='#21262d',title='% Change'),yaxis=dict(gridcolor='#21262d'))
-                st.plotly_chart(fig_dd, use_container_width=True)
+                t5=df_f.groupby('share_name',as_index=False).agg({'Invested':'sum','Current':'sum','PnL':'sum','Weight':'sum'}).nlargest(5,'Weight')
+                t5['Ret%']=(t5['PnL']/t5['Invested']*100)
+                st.dataframe(t5[['share_name','Weight','Invested','Current','PnL','Ret%']].rename(columns={'share_name':'Stock','Weight':'W%','Invested':'Inv ₹','Current':'Cur ₹','PnL':'P&L'}).style.format({'W%':'{:.1f}%','Inv ₹':'₹{:,.0f}','Cur ₹':'₹{:,.0f}','P&L':'₹{:,.0f}','Ret%':'{:+.1f}%'}).map(cpnl,subset=['P&L','Ret%']),use_container_width=True,height=210)
+            with t2:
+                st.markdown("#### 📉 Drawdown from Buy")
+                ddd=df_f.copy(); ddd['DD%']=((ddd['Simulated_Live']-ddd['buy_price'])/ddd['buy_price'].replace(0,1)*100)
+                dg=ddd.groupby('share_name',as_index=False).agg({'DD%':'mean'}).sort_values('DD%').head(10)
+                fig_dd=go.Figure(go.Bar(x=dg['DD%'],y=dg['share_name'],orientation='h',marker_color=['#f85149' if v<0 else '#3fb950' for v in dg['DD%']],text=dg['DD%'].apply(lambda v:f"{v:+.1f}%"),textposition='auto'))
+                fig_dd.update_layout(plot_bgcolor='#161b22',paper_bgcolor='#0d1117',font=dict(color='#8b949e'),margin=dict(l=10,r=10,t=10,b=10),xaxis=dict(gridcolor='#21262d'),yaxis=dict(gridcolor='#21262d'))
+                st.plotly_chart(fig_dd,use_container_width=True)
 
-            # ── Tools ─────────────────────────────────────────────────
-            st.markdown("---"); st.markdown("### 🛠️ Advanced Tools")
-            tc1,tc2=st.columns(2)
-            with tc1:
-                st.markdown("<h4>💸 Tax Estimator</h4>", unsafe_allow_html=True)
-                hold_dur=st.radio("Holding duration:",["STCG (<1yr)","LTCG (>1yr)"],horizontal=True)
-                if total_pnl>0:
-                    if "STCG" in hold_dur: st.warning(f"STCG @20%: ₹{total_pnl*0.20:,.2f}")
-                    else: st.success(f"LTCG @12.5% (after ₹1L exemption): ₹{max(0,total_pnl-100000)*0.125:,.2f}")
-                else: st.info("Portfolio in loss — no tax.")
-            with tc2:
-                st.markdown("<h4>📥 Export</h4>", unsafe_allow_html=True)
-                st.download_button("📥 Download Portfolio CSV", data=display_df.to_csv(index=False).encode('utf-8'), file_name="AlphaPortfolio_Report.csv", mime="text/csv", use_container_width=True)
-        else:
-            st.warning("No data for selected filter.")
+            st.markdown("---")
+            tc1_,tc2_=st.columns(2)
+            with tc1_:
+                st.markdown("<h4>💸 Tax Estimator</h4>",unsafe_allow_html=True)
+                hd_=st.radio("Duration:",["STCG (<1yr)","LTCG (>1yr)"],horizontal=True)
+                if tp>0:
+                    if "STCG" in hd_: st.warning(f"STCG @20%: ₹{tp*0.20:,.2f}")
+                    else: st.success(f"LTCG @12.5% (after ₹1L): ₹{max(0,tp-100000)*0.125:,.2f}")
+                else: st.info("In loss — no tax.")
+            with tc2_:
+                st.markdown("<h4>📥 Export</h4>",unsafe_allow_html=True)
+                st.download_button("📥 Download CSV",data=dd.to_csv(index=False).encode(),file_name="portfolio_report.csv",mime="text/csv",use_container_width=True)
+        else: st.warning("No data for selected filter.")
 
-    # ════════════════ ADVANCED ANALYSIS ══════════════════════════════
+    # ═══ ADVANCED ANALYSIS ═══════════════════════════════════════════
     elif "Advanced Analysis" in menu or "📈" in menu:
-        st.markdown("<h3>📊 Advanced Analysis & Performance Matrix</h3>", unsafe_allow_html=True)
-
-        tx_df_adv = st.session_state.get("transactions_df", pd.DataFrame())
-        if not tx_df_adv.empty:
-            rd_adv,_ = compute_fifo_realized_pnl(tx_df_adv)
-            total_realized_adv = rd_adv['realized_pnl'].sum() if not rd_adv.empty else 0
-        else:
-            total_realized_adv = 0
-        total_unrealized_adv = df['PnL'].sum()
-        combined_pnl = total_realized_adv + total_unrealized_adv
-
-        st.markdown("<h4>💵 Realized vs Unrealized P&L</h4>", unsafe_allow_html=True)
+        st.markdown("<h3>📊 Advanced Analysis</h3>",unsafe_allow_html=True)
+        txd2=st.session_state.transactions
+        total_r=0
+        if not txd2.empty:
+            rd2,_=compute_fifo(txd2)
+            total_r=rd2['realized_pnl'].sum() if not rd2.empty else 0
         ru1,ru2,ru3=st.columns(3)
-        ru1.markdown(f'<div class="terminal-card"><div class="metric-title">REALIZED P&L</div><div class="metric-value" style="color:{"#3fb950" if total_realized_adv>=0 else "#f85149"};">₹{total_realized_adv:,.2f}</div><div class="metric-status-blue">From Ledger</div></div>', unsafe_allow_html=True)
-        ru2.markdown(f'<div class="terminal-card"><div class="metric-title">UNREALIZED P&L</div><div class="metric-value" style="color:{"#3fb950" if total_unrealized_adv>=0 else "#f85149"};">₹{total_unrealized_adv:,.2f}</div><div class="metric-status-blue">From Live Portfolio</div></div>', unsafe_allow_html=True)
-        ru3.markdown(f'<div class="terminal-card"><div class="metric-title">TOTAL P&L</div><div class="metric-value" style="color:{"#3fb950" if combined_pnl>=0 else "#f85149"};">₹{combined_pnl:,.2f}</div><div class="metric-status-blue">Combined</div></div>', unsafe_allow_html=True)
+        ru1.markdown(f'<div class="tc"><div class="mt">REALIZED P&L</div><div class="mv" style="color:{"#3fb950" if total_r>=0 else "#f85149"};">₹{total_r:,.2f}</div><div class="mb">From Ledger</div></div>',unsafe_allow_html=True)
+        ru2.markdown(f'<div class="tc"><div class="mt">UNREALIZED P&L</div><div class="mv" style="color:{"#3fb950" if tp>=0 else "#f85149"};">₹{tp:,.2f}</div><div class="mb">Live Portfolio</div></div>',unsafe_allow_html=True)
+        comb=total_r+tp
+        ru3.markdown(f'<div class="tc"><div class="mt">TOTAL P&L</div><div class="mv" style="color:{"#3fb950" if comb>=0 else "#f85149"};">₹{comb:,.2f}</div><div class="mb">Combined</div></div>',unsafe_allow_html=True)
         st.markdown("---")
-
-        best_s=df.loc[df['Returns_Pct'].idxmax()]; worst_s=df.loc[df['Returns_Pct'].idxmin()]; mw_s=df.loc[df['Weight'].idxmax()]
-        ac1,ac2,ac3=st.columns(3)
-        ac1.markdown(f'<div class="terminal-card"><div class="metric-title">🔥 TOP GAINER</div><div class="metric-value" style="color:#3fb950;">{best_s["share_name"]}</div><div class="metric-status-green">{best_s["Returns_Pct"]:+.2f}%</div></div>', unsafe_allow_html=True)
-        ac2.markdown(f'<div class="terminal-card"><div class="metric-title">⚠️ UNDERPERFORMER</div><div class="metric-value" style="color:#f85149;">{worst_s["share_name"]}</div><div class="metric-status-red">{worst_s["Returns_Pct"]:+.2f}%</div></div>', unsafe_allow_html=True)
-        ac3.markdown(f'<div class="terminal-card"><div class="metric-title">🏢 CONCENTRATION</div><div class="metric-value" style="color:#58a6ff;">{mw_s["share_name"]}</div><div class="metric-status-blue">{mw_s["Weight"]:.2f}%</div></div>', unsafe_allow_html=True)
-
+        bs=df.loc[df['Returns_Pct'].idxmax()]; ws=df.loc[df['Returns_Pct'].idxmin()]; mw=df.loc[df['Weight'].idxmax()]
+        a1,a2,a3=st.columns(3)
+        a1.markdown(f'<div class="tc"><div class="mt">🔥 TOP GAINER</div><div class="mv" style="color:#3fb950;">{bs["share_name"]}</div><div class="mg">{bs["Returns_Pct"]:+.2f}%</div></div>',unsafe_allow_html=True)
+        a2.markdown(f'<div class="tc"><div class="mt">⚠️ UNDERPERFORMER</div><div class="mv" style="color:#f85149;">{ws["share_name"]}</div><div class="mr">{ws["Returns_Pct"]:+.2f}%</div></div>',unsafe_allow_html=True)
+        a3.markdown(f'<div class="tc"><div class="mt">🏢 MAX WEIGHT</div><div class="mv" style="color:#58a6ff;">{mw["share_name"]}</div><div class="mb">{mw["Weight"]:.2f}%</div></div>',unsafe_allow_html=True)
         ca1,ca2=st.columns(2)
         with ca1:
-            st.markdown("<h4>🗺️ Portfolio Heatmap</h4>", unsafe_allow_html=True)
-            df_tree=df.groupby('share_name',as_index=False).agg({'Invested':'sum','PnL':'sum'})
-            df_tree['Returns_Pct']=(df_tree['PnL']/df_tree['Invested'].replace(0,1)*100)
-            fig_tree=px.treemap(df_tree,path=['share_name'],values='Invested',color='Returns_Pct',color_continuous_scale='RdYlGn',color_continuous_midpoint=0,template="plotly_dark")
-            fig_tree.update_layout(margin=dict(l=10,r=10,t=10,b=10),paper_bgcolor='#0d1117')
-            st.plotly_chart(fig_tree, use_container_width=True)
+            st.markdown("<h4>🗺️ Heatmap</h4>",unsafe_allow_html=True)
+            dt_=df.groupby('share_name',as_index=False).agg({'Invested':'sum','PnL':'sum'})
+            dt_['Ret']=(dt_['PnL']/dt_['Invested'].replace(0,1)*100)
+            fig_tr=px.treemap(dt_,path=['share_name'],values='Invested',color='Ret',color_continuous_scale='RdYlGn',color_continuous_midpoint=0,template="plotly_dark")
+            fig_tr.update_layout(margin=dict(l=10,r=10,t=10,b=10),paper_bgcolor='#0d1117')
+            st.plotly_chart(fig_tr,use_container_width=True)
         with ca2:
-            st.markdown("<h4>🔵 Risk vs Return</h4>", unsafe_allow_html=True)
+            st.markdown("<h4>🔵 Risk vs Return</h4>",unsafe_allow_html=True)
             fig_sc=px.scatter(df,x='Invested',y='Returns_Pct',size='quantity',color='PnL',hover_name='share_name',color_continuous_scale='RdYlGn',template="plotly_dark",size_max=40)
-            fig_sc.update_layout(plot_bgcolor='#161b22',paper_bgcolor='#0d1117',font=dict(color='#8b949e'),margin=dict(l=10,r=10,t=10,b=10),xaxis=dict(title="Investment (₹)",gridcolor='#21262d'),yaxis=dict(title="Returns (%)",gridcolor='#21262d'))
-            st.plotly_chart(fig_sc, use_container_width=True)
+            fig_sc.update_layout(plot_bgcolor='#161b22',paper_bgcolor='#0d1117',font=dict(color='#8b949e'),margin=dict(l=10,r=10,t=10,b=10),xaxis=dict(title="Investment ₹",gridcolor='#21262d'),yaxis=dict(title="Returns %",gridcolor='#21262d'))
+            st.plotly_chart(fig_sc,use_container_width=True)
 
-    # ════════════════ SINGLE STOCK DEEP-DIVE ═════════════════════════
+    # ═══ SINGLE STOCK DEEP-DIVE ═══════════════════════════════════════
     elif "Single Stock" in menu or "🔍" in menu:
-        st.markdown("<h3>🔍 Single Stock Deep-Dive</h3>", unsafe_allow_html=True)
-        sel_s=st.selectbox("Select stock:",sorted(df['share_name'].unique()))
-        sr=df[df['share_name']==sel_s]; sd=sr.iloc[0]
-        tq=sr['quantity'].sum(); ti=sr['Invested'].sum(); ab=ti/tq if tq>0 else 0
-        tc_=sr['Current'].sum(); tp_s=sr['PnL'].sum(); rp_=(tp_s/ti*100) if ti>0 else 0
-
+        st.markdown("<h3>🔍 Single Stock Deep-Dive</h3>",unsafe_allow_html=True)
+        ss_=st.selectbox("Select stock:",sorted(df['share_name'].unique()))
+        sr=df[df['share_name']==ss_]; sd=sr.iloc[0]
+        tq_=sr['quantity'].sum(); ti_=sr['Invested'].sum()
+        ab_=ti_/tq_ if tq_>0 else 0; tc_2=sr['Current'].sum(); tp_s=sr['PnL'].sum()
+        rp_=(tp_s/ti_*100) if ti_>0 else 0
         sc1,sc2,sc3,sc4,sc5,sc6=st.columns(6)
-        sc1.markdown(f'<div class="terminal-card"><div class="metric-title">AVG BUY PRICE</div><div class="metric-value">₹{ab:,.2f}</div></div>', unsafe_allow_html=True)
-        sc2.markdown(f'<div class="terminal-card"><div class="metric-title">LIVE PRICE</div><div class="metric-value">₹{sd["Simulated_Live"]:,.2f}</div></div>', unsafe_allow_html=True)
-        sc3.markdown(f'<div class="terminal-card"><div class="metric-title">NET P&L</div><div class="metric-value" style="color:{"#3fb950" if tp_s>=0 else "#f85149"};">₹{tp_s:,.0f}</div></div>', unsafe_allow_html=True)
-        sc4.markdown(f'<div class="terminal-card"><div class="metric-title">RETURN</div><div class="metric-value" style="color:{"#3fb950" if rp_>=0 else "#f85149"};">{rp_:+.2f}%</div></div>', unsafe_allow_html=True)
-        sc5.markdown(f'<div class="terminal-card"><div class="metric-title">52W HIGH</div><div class="metric-value" style="color:#3fb950;">₹{sd["high_52w"]:,.2f}</div></div>', unsafe_allow_html=True)
-        sc6.markdown(f'<div class="terminal-card"><div class="metric-title">52W LOW</div><div class="metric-value" style="color:#f85149;">₹{sd["low_52w"]:,.2f}</div></div>', unsafe_allow_html=True)
-
+        sc1.markdown(f'<div class="tc"><div class="mt">AVG BUY</div><div class="mv">₹{ab_:,.2f}</div></div>',unsafe_allow_html=True)
+        sc2.markdown(f'<div class="tc"><div class="mt">LIVE PRICE</div><div class="mv">₹{sd["Simulated_Live"]:,.2f}</div></div>',unsafe_allow_html=True)
+        sc3.markdown(f'<div class="tc"><div class="mt">NET P&L</div><div class="mv" style="color:{"#3fb950" if tp_s>=0 else "#f85149"};">₹{tp_s:,.0f}</div></div>',unsafe_allow_html=True)
+        sc4.markdown(f'<div class="tc"><div class="mt">RETURN</div><div class="mv" style="color:{"#3fb950" if rp_>=0 else "#f85149"};">{rp_:+.2f}%</div></div>',unsafe_allow_html=True)
+        sc5.markdown(f'<div class="tc"><div class="mt">52W HIGH</div><div class="mv" style="color:#3fb950;">₹{sd["high_52w"]:,.2f}</div></div>',unsafe_allow_html=True)
+        sc6.markdown(f'<div class="tc"><div class="mt">52W LOW</div><div class="mv" style="color:#f85149;">₹{sd["low_52w"]:,.2f}</div></div>',unsafe_allow_html=True)
         rtk=sd.get('resolved_ticker','')
         if rtk:
             try: h1y_=yf.Ticker(rtk).history(period="1y")
             except: h1y_=pd.DataFrame()
             if not h1y_.empty:
                 fig_ss=go.Figure()
-                fig_ss.add_trace(go.Scatter(x=h1y_.index,y=h1y_['Close'],name='Price',line=dict(color='#58a6ff',width=2),fill='tozeroy',fillcolor='rgba(88,166,255,0.06)'))
-                fig_ss.add_hline(y=ab,line_dash="dash",line_color="#e3b341",annotation_text=f"Avg Buy ₹{ab:,.2f}",annotation_position="top left",annotation=dict(font=dict(color="#e3b341")))
+                fig_ss.add_trace(go.Scatter(x=h1y_.index,y=h1y_['Close'],line=dict(color='#58a6ff',width=2),fill='tozeroy',fillcolor='rgba(88,166,255,0.06)'))
+                fig_ss.add_hline(y=ab_,line_dash="dash",line_color="#e3b341",annotation_text=f"Avg Buy ₹{ab_:,.2f}",annotation_dict=dict(font=dict(color="#e3b341")))
                 if sd['high_52w']>0:
-                    fig_ss.add_hline(y=sd['high_52w'],line_dash="dot",line_color="#3fb950",annotation_text=f"52W High ₹{sd['high_52w']:,.2f}",annotation_position="top right",annotation=dict(font=dict(color="#3fb950")))
-                    fig_ss.add_hline(y=sd['low_52w'],line_dash="dot",line_color="#f85149",annotation_text=f"52W Low ₹{sd['low_52w']:,.2f}",annotation_position="bottom right",annotation=dict(font=dict(color="#f85149")))
-                fig_ss.update_layout(plot_bgcolor='#161b22',paper_bgcolor='#0d1117',font=dict(color='#8b949e'),margin=dict(l=10,r=10,t=40,b=10),title=dict(text=f"{sel_s} — 1-Year Chart",font=dict(color='#e6edf3',size=14)),xaxis=dict(gridcolor='#21262d'),yaxis=dict(gridcolor='#21262d',title='₹'),showlegend=False)
-                st.plotly_chart(fig_ss, use_container_width=True)
-
-        fig_g=go.Figure(go.Indicator(mode="gauge+number+delta",value=rp_,delta={'reference':0,'valueformat':'.2f','suffix':'%'},domain={'x':[0,1],'y':[0,1]},title={'text':f"Return — {sel_s}",'font':{'color':'#e6edf3'}},number={'suffix':'%','font':{'color':'#58a6ff'}},gauge={'axis':{'range':[-50,100],'tickcolor':'#8b949e'},'bar':{'color':'#58a6ff'},'steps':[{'range':[-50,0],'color':'rgba(248,81,73,0.15)'},{'range':[0,100],'color':'rgba(63,185,80,0.12)'}],'threshold':{'line':{'color':'#e3b341','width':3},'thickness':0.75,'value':target_pct}}))
+                    fig_ss.add_hline(y=sd['high_52w'],line_dash="dot",line_color="#3fb950",annotation_text=f"52W Hi",annotation_dict=dict(font=dict(color="#3fb950")))
+                    fig_ss.add_hline(y=sd['low_52w'],line_dash="dot",line_color="#f85149",annotation_text=f"52W Lo",annotation_dict=dict(font=dict(color="#f85149")))
+                fig_ss.update_layout(plot_bgcolor='#161b22',paper_bgcolor='#0d1117',font=dict(color='#8b949e'),margin=dict(l=10,r=10,t=40,b=10),title=dict(text=f"{ss_} — 1-Year Chart",font=dict(color='#e6edf3')),xaxis=dict(gridcolor='#21262d'),yaxis=dict(gridcolor='#21262d',title='₹'),showlegend=False)
+                st.plotly_chart(fig_ss,use_container_width=True)
+        fig_g=go.Figure(go.Indicator(mode="gauge+number+delta",value=rp_,delta={'reference':0,'suffix':'%'},domain={'x':[0,1],'y':[0,1]},title={'text':f"Return — {ss_}",'font':{'color':'#e6edf3'}},number={'suffix':'%','font':{'color':'#58a6ff'}},gauge={'axis':{'range':[-50,100]},'bar':{'color':'#58a6ff'},'steps':[{'range':[-50,0],'color':'rgba(248,81,73,0.15)'},{'range':[0,100],'color':'rgba(63,185,80,0.12)'}],'threshold':{'line':{'color':'#e3b341','width':3},'thickness':0.75,'value':target_pct}}))
         fig_g.update_layout(paper_bgcolor='#0d1117',font=dict(color='#8b949e'),margin=dict(l=20,r=20,t=50,b=20))
-        st.plotly_chart(fig_g, use_container_width=True)
+        st.plotly_chart(fig_g,use_container_width=True)
 
 else:
-    st.info("💡 Terminal ready! Upload your portfolio file, or use '🔎 Search Any Stock' — both work independently.")
+    st.info("💡 Terminal ready! Upload your portfolio file, or explore any menu option above — AI Advisor, Technical Indicators, Options Chain, and MF Tracker all work without a portfolio file.")
