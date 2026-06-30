@@ -469,6 +469,13 @@ def rule_based_advisor(df_port, question_type="general", user_question=""):
     if df_port is None or df_port.empty:
         return "📭 No portfolio data loaded yet. Upload your holdings file first so I can analyze it."
 
+    required_cols = {'Invested','share_name'}
+    if not required_cols.issubset(df_port.columns):
+        return ("⚠️ Your portfolio file is uploaded but hasn't been processed yet.\n\n"
+                "Please visit the **🖥️ Overview Dashboard** tab first — that's where column mapping, "
+                "ticker resolution, and live price fetching happen. Once that's done, come back here "
+                "and the AI Advisor will have full access to your live P&L, weights, and sector data.")
+
     d = df_port.copy()
     total_inv = d['Invested'].sum()
     total_cur = d['Current'].sum() if 'Current' in d.columns else total_inv
@@ -621,6 +628,9 @@ def rule_based_advisor(df_port, question_type="general", user_question=""):
 def build_portfolio_context(df_port):
     """Build a concise portfolio summary string (used for display/debug, not an external API)."""
     if df_port is None or df_port.empty: return "No portfolio data available."
+    required_cols = {'Invested','share_name'}
+    if not required_cols.issubset(df_port.columns):
+        return "Portfolio file uploaded but not yet processed — visit Overview Dashboard first to load live prices and calculate P&L."
     total_inv = df_port['Invested'].sum()
     total_cur = df_port['Current'].sum() if 'Current' in df_port.columns else 0
     total_pnl = (total_cur - total_inv) if total_cur else 0
@@ -826,6 +836,8 @@ if "AI" in menu or "🤖" in menu:
         st.markdown("#### 📋 Instant AI Analysis of Your Portfolio")
         if df.empty:
             st.info("💡 Upload your portfolio file above to get an instant AI analysis of your holdings, risks, and rebalancing suggestions.")
+        elif 'Invested' not in df.columns:
+            st.warning("⚠️ File uploaded but not yet processed. Please visit **🖥️ Overview Dashboard** first (to map columns and load live prices), then come back here for AI analysis.")
         else:
             col_a1, col_a2 = st.columns([3,1])
             with col_a1:
