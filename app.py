@@ -137,7 +137,8 @@ st.markdown("""<style>
 h1,h2,h3,h4{color:#e6edf3!important;}
 </style>""", unsafe_allow_html=True)
 
-st_autorefresh(interval=1000, key="ar1")
+# Auto-refresh is only enabled on Overview Dashboard (set per-tab below)
+# Global refresh every 1 second was causing session state wipe on every tab switch
 
 # ══════════════════════════════════════════════════════════════════════
 # TICKER RESOLVER
@@ -333,11 +334,13 @@ def get_technical_signal(df):
 # ══════════════════════════════════════════════════════════════════════
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_options(ticker):
-    """Fetch options chain from Yahoo Finance for a given ticker."""
+    """Fetch options chain from Yahoo Finance for a given ticker.
+    Returns (calls_df, puts_df, expiry_list, error_message). error_message is None on success."""
     try:
         tk = yf.Ticker(ticker)
         exp_dates = tk.options
-        if not exp_dates: return None, None, []
+        if not exp_dates:
+            return None, None, [], f"No options/F&O data listed for '{ticker}' on Yahoo Finance."
         nearest_exp = exp_dates[0]
         chain = tk.option_chain(nearest_exp)
         calls = chain.calls[['strike','lastPrice','bid','ask','volume','openInterest','impliedVolatility']].copy()
@@ -346,8 +349,11 @@ def fetch_options(ticker):
         puts.columns  = ['Strike','Last','Bid','Ask','Volume','OI','IV']
         calls['IV'] = (calls['IV'] * 100).round(2)
         puts['IV']  = (puts['IV']  * 100).round(2)
-        return calls, puts, list(exp_dates)
-    except: return None, None, []
+        calls = calls.fillna(0)
+        puts  = puts.fillna(0)
+        return calls, puts, list(exp_dates), None
+    except Exception as e:
+        return None, None, [], f"{type(e).__name__}: {e}"
 
 # ══════════════════════════════════════════════════════════════════════
 # MUTUAL FUND TRACKER
@@ -746,7 +752,7 @@ def cpnl(v):
 # ══════════════════════════════════════════════════════════════════════
 for k,v in [("alerted",set()),("overrides",None),("transactions",None),("mappings",None),
             ("settings",None),("mf_list",None),("search_ticker",""),
-            ("ai_history",[]),("ai_portfolio_analysis","")]:
+            ("ai_history",[]),("ai_portfolio_analysis",""),("processed_portfolio_df",None)]:
     if k not in st.session_state: st.session_state[k]=v
 
 if st.session_state.overrides   is None: st.session_state.overrides   = load_overrides()
@@ -820,6 +826,78 @@ if uploaded_file:
         df = pd.read_excel(uploaded_file) if uploaded_file.name.endswith('.xlsx') else pd.read_csv(uploaded_file)
     except Exception as e: st.error(f"File Error: {e}")
 
+# df_live: the fully-processed portfolio (Invested/PnL/Weight/live prices etc.)
+#
+# IMPORTANT: this is now computed UNIVERSALLY below (regardless of which menu tab is
+# currently active), as long as a column mapping has already been saved once (via the
+# Overview Dashboard mapping UI). This means AI Advisor, Options Chain, Technical
+# Indicators etc. always have access to fresh live data on every page, without requiring
+# the user to physically revisit Overview Dashboard in every session. The underlying
+# fetch functions (resolve_tickers/fetch_prices/fetch_52w) are all @st.cache_data-cached,
+# so repeating this computation on every rerun is cheap after the first cold-cache pass.
+def _process_portfolio_universal(df_raw, tc_, qc_, pc_, mkt_shock, tgt_pct, sl_pct):
+    """Column-map, resolve tickers, fetch live prices, and compute P&L for the uploaded
+    portfolio file. Returns (df_processed, unresolved_list). Never raises — returns an
+    empty DataFrame on any failure so the calling page can show a graceful fallback."""
+    try:
+        d = df_raw.copy()
+        d.columns = d.columns.str.strip()
+        d = d.dropna(subset=[tc_])
+        d[tc_] = d[tc_].astype(str).str.strip()
+        d = d[(d[tc_]!='') & (~d[tc_].str.contains('Total|TOTAL|Grand', case=False, na=False))]
+        d['quantity']  = pd.to_numeric(d[qc_], errors='coerce').fillna(0)
+        d['buy_price'] = pd.to_numeric(d[pc_], errors='coerce').fillna(0)
+        d['Invested']  = d['quantity'] * d['buy_price']
+        d = d[d['Invested'] > 0].copy()
+        if d.empty:
+            return pd.DataFrame(), []
+
+        uniq  = d[tc_].unique().tolist()
+        ov_t  = tuple(sorted(st.session_state.overrides.items()))
+        trmap = resolve_tickers(tuple(uniq), ov_t)
+        d['resolved_ticker'] = d[tc_].map(trmap)
+        unresolved  = sorted({r for r,v in trmap.items() if not v})
+        resolved_t  = sorted({t for t in trmap.values() if t})
+
+        prices = fetch_prices(tuple(resolved_t))
+        rng    = fetch_52w(tuple(resolved_t))
+
+        d['live_price'] = d['resolved_ticker'].map(prices).fillna(0)
+        d['share_name'] = d[tc_]
+        d['high_52w']   = d['resolved_ticker'].map(lambda t: rng.get(t,(0,0))[0] if t else 0).fillna(0)
+        d['low_52w']    = d['resolved_ticker'].map(lambda t: rng.get(t,(0,0))[1] if t else 0).fillna(0)
+
+        d['Simulated_Live'] = d['live_price'] * (1 + mkt_shock/100)
+        d['Current']    = d['quantity'] * d['Simulated_Live']
+        d['PnL']        = d['Current'] - d['Invested']
+        d['Returns_Pct']= (d['PnL'] / d['Invested']) * 100
+        d['Weight']     = (d['Invested'] / d['Invested'].sum()) * 100
+        d['Action']     = d.apply(lambda r: f"🎯 PROFIT (+{tgt_pct}%)" if r['Returns_Pct']>=tgt_pct else (f"⚠️ STOP ({sl_pct}%)" if r['Returns_Pct']<=sl_pct else "🟢 HOLD"), axis=1)
+        d['Range_Status']= d.apply(lambda r: "📈 AT 52W HIGH" if r['high_52w'] and r['live_price']>=r['high_52w'] else ("📉 AT 52W LOW" if r['low_52w'] and r['live_price']<=r['low_52w'] else ""), axis=1)
+        return d, unresolved
+    except Exception:
+        return pd.DataFrame(), []
+
+
+portfolio_unresolved = []
+if not df.empty:
+    _spm = st.session_state.mappings.get("portfolio", {})
+    _tc, _qc, _pc = _spm.get("ticker"), _spm.get("qty"), _spm.get("price")
+    _cols_now = list(df.columns.str.strip())
+    if _tc in _cols_now and _qc in _cols_now and _pc in _cols_now:
+        df_live, portfolio_unresolved = _process_portfolio_universal(df, _tc, _qc, _pc, market_shock, target_pct, stop_loss_pct)
+        if not df_live.empty:
+            st.session_state.processed_portfolio_df = df_live.copy()
+        else:
+            df_live = st.session_state.processed_portfolio_df if st.session_state.processed_portfolio_df is not None else pd.DataFrame()
+    else:
+        # No saved mapping yet (or it doesn't match this file's columns) — fall back to
+        # whatever was processed previously, if anything. User needs to visit Overview
+        # Dashboard once to pick columns and click Save.
+        df_live = st.session_state.processed_portfolio_df if st.session_state.processed_portfolio_df is not None else pd.DataFrame()
+else:
+    df_live = st.session_state.processed_portfolio_df if st.session_state.processed_portfolio_df is not None else pd.DataFrame()
+
 # ══════════════════════════════════════════════════════════════════════
 # AI PORTFOLIO ADVISOR
 # ══════════════════════════════════════════════════════════════════════
@@ -827,17 +905,18 @@ if "AI" in menu or "🤖" in menu:
     st.markdown("<h3>🤖 AI Portfolio Advisor</h3>", unsafe_allow_html=True)
     st.caption("Free rule-based investment advisor — analyzes your actual holdings data using financial rules (concentration, sector exposure, tax timing, momentum). No API key needed.")
 
-    # Build portfolio context if file uploaded and processed
-    port_ctx = build_portfolio_context(df if not df.empty else None)
+    if df_live.empty and not df.empty:
+        st.info("📋 Your file is uploaded but hasn't been processed yet this session. Visit **🖥️ Overview Dashboard** once (map columns, click Save) — after that, this page will automatically use the live, calculated data every time you return, even without re-uploading.")
+
+    # Build portfolio context from the processed (live) portfolio, not the raw upload
+    port_ctx = build_portfolio_context(df_live if not df_live.empty else None)
 
     ai_tab1, ai_tab2 = st.tabs(["📋 Auto Portfolio Analysis", "💬 Chat with AI"])
 
     with ai_tab1:
         st.markdown("#### 📋 Instant AI Analysis of Your Portfolio")
-        if df.empty:
-            st.info("💡 Upload your portfolio file above to get an instant AI analysis of your holdings, risks, and rebalancing suggestions.")
-        elif 'Invested' not in df.columns:
-            st.warning("⚠️ File uploaded but not yet processed. Please visit **🖥️ Overview Dashboard** first (to map columns and load live prices), then come back here for AI analysis.")
+        if df_live.empty:
+            st.info("💡 Upload your portfolio file, then visit **🖥️ Overview Dashboard** once to process it — after that, an instant AI analysis of your holdings, risks, and rebalancing suggestions will be available here.")
         else:
             col_a1, col_a2 = st.columns([3,1])
             with col_a1:
@@ -864,7 +943,7 @@ if "AI" in menu or "🤖" in menu:
                         "📊 Sector Diversification Review": "sector",
                     }
                     with st.spinner("🤖 Analyzing your portfolio..."):
-                        result = rule_based_advisor(df, type_map.get(analysis_type, "health"))
+                        result = rule_based_advisor(df_live, type_map.get(analysis_type, "health"))
                     st.session_state.ai_portfolio_analysis = result
                 if st.session_state.ai_portfolio_analysis:
                     st.markdown(f'<div class="ai-msg">{st.session_state.ai_portfolio_analysis}</div>', unsafe_allow_html=True)
@@ -906,7 +985,7 @@ if "AI" in menu or "🤖" in menu:
 
         if final_input:
             with st.spinner("🤖 Analyzing..."):
-                reply = rule_based_advisor(df if not df.empty else None, "qa", final_input)
+                reply = rule_based_advisor(df_live if not df_live.empty else None, "qa", final_input)
             st.session_state.ai_history.append({"role":"user","content":final_input})
             st.session_state.ai_history.append({"role":"assistant","content":reply})
             if len(st.session_state.ai_history) > 20:
@@ -1000,15 +1079,34 @@ elif "Technical" in menu or "📊" in menu:
 elif "Options" in menu or "⛓️" in menu:
     st.markdown("<h3>⛓️ Options Chain Viewer</h3>", unsafe_allow_html=True)
     st.caption("Live F&O data — Calls & Puts with Strike, Last Price, Bid, Ask, Volume, Open Interest, and Implied Volatility.")
+    st.info("💡 **Indian NSE stocks:** Yahoo Finance supports F&O for indices like **^NSEI (Nifty 50)**, **^NSEBANK (Bank Nifty)**. For individual stocks use format like **RELIANCE.NS** — but note Yahoo's Indian stock options coverage is limited. US stocks like **AAPL, TSLA, SPY** have the best coverage.")
 
-    oc_query = st.text_input("Enter ticker:", placeholder="RELIANCE.NS, TCS.NS, NIFTY (use ^NSEI for Nifty index)")
+    # Quick-pick buttons
+    st.markdown("**Quick picks:**")
+    qoc1,qoc2,qoc3,qoc4,qoc5 = st.columns(5)
+    oc_prefill = ""
+    if qoc1.button("^NSEI (Nifty)", use_container_width=True): oc_prefill = "^NSEI"
+    if qoc2.button("^NSEBANK", use_container_width=True):      oc_prefill = "^NSEBANK"
+    if qoc3.button("RELIANCE.NS", use_container_width=True):   oc_prefill = "RELIANCE.NS"
+    if qoc4.button("AAPL (US)", use_container_width=True):     oc_prefill = "AAPL"
+    if qoc5.button("SPY (US ETF)", use_container_width=True):  oc_prefill = "SPY"
+
+    if "oc_ticker_val" not in st.session_state: st.session_state.oc_ticker_val = ""
+    if oc_prefill: st.session_state.oc_ticker_val = oc_prefill
+
+    oc_query = st.text_input("Or enter any ticker:", value=st.session_state.oc_ticker_val,
+                              placeholder="e.g. ^NSEI, RELIANCE.NS, AAPL, SPY", key="oc_input")
+
     if oc_query.strip():
         tk_oc = oc_query.strip().upper()
         with st.spinner(f"Fetching options chain for {tk_oc}..."):
-            calls, puts, exp_dates = fetch_options(tk_oc)
+            calls, puts, exp_dates, oc_error = fetch_options(tk_oc)
 
         if calls is None or calls.empty:
-            st.error(f"⚠️ Options data not available for {tk_oc}. Note: F&O data requires a valid options-eligible ticker (e.g. RELIANCE.NS, NIFTY50=F.NS). Try AAPL or SPY for US options.")
+            st.error(f"⚠️ Options data not available for **{tk_oc}**.\n\n"
+                     + (f"**Details:** `{oc_error}`\n\n" if oc_error else "")
+                     + f"**For Indian F&O:** Try **^NSEI** (Nifty 50 index) or **^NSEBANK** (Bank Nifty) — these have the best NSE options coverage on Yahoo Finance. Individual NSE stock options have very limited coverage.\n\n"
+                     f"**For US stocks:** Try **AAPL**, **TSLA**, **SPY**, **QQQ** — US options have full coverage.")
         else:
             # Expiry selector
             if len(exp_dates) > 1:
@@ -1022,7 +1120,9 @@ elif "Options" in menu or "⛓️" in menu:
                             calls.columns = puts.columns = ['Strike','Last','Bid','Ask','Volume','OI','IV']
                             calls['IV'] = (calls['IV']*100).round(2)
                             puts['IV']  = (puts['IV']*100).round(2)
-                        except: pass
+                            calls = calls.fillna(0); puts = puts.fillna(0)
+                        except Exception as e:
+                            st.warning(f"⚠️ Could not load expiry {sel_exp}: {e}. Showing nearest expiry instead.")
             else:
                 st.caption(f"Expiry: **{exp_dates[0]}**")
 
@@ -1527,6 +1627,10 @@ elif not df.empty:
     df['Action']=df.apply(lambda r: f"🎯 PROFIT (+{target_pct}%)" if r['Returns_Pct']>=target_pct else (f"⚠️ STOP ({stop_loss_pct}%)" if r['Returns_Pct']<=stop_loss_pct else "🟢 HOLD"), axis=1)
     df['Range_Status']=df.apply(lambda r: "📈 AT 52W HIGH" if r['high_52w'] and r['live_price']>=r['high_52w'] else ("📉 AT 52W LOW" if r['low_52w'] and r['live_price']<=r['low_52w'] else ""), axis=1)
 
+    # Persist the fully-processed portfolio so other tabs (AI Advisor, Options Chain, etc.)
+    # can use it even after the script reruns on a different menu selection.
+    st.session_state.processed_portfolio_df = df.copy()
+
     ti=df['Invested'].sum(); tc_v=df['Current'].sum(); tp=df['PnL'].sum()
     wr_=(tp/ti*100) if ti>0 else 0; ns=len(df); ps=(df['PnL']>0).sum()
     wr2=(ps/ns*100) if ns>0 else 0
@@ -1546,7 +1650,9 @@ elif not df.empty:
 
     # ═══ OVERVIEW ════════════════════════════════════════════════════
     if "Overview" in menu or "🖥️" in menu:
-        st.caption(f"🔄 Auto-refresh 1s | {now_ist().strftime('%H:%M:%S')} IST" + (f" | ⚠️ Stress: {market_shock:+.0f}%" if market_shock!=0 else ""))
+        # Auto-refresh only on Overview Dashboard (60 seconds for live prices)
+        st_autorefresh(interval=60000, key="overview_refresh")
+        st.caption(f"🔄 Auto-refresh 60s | {now_ist().strftime('%H:%M:%S')} IST" + (f" | ⚠️ Stress: {market_shock:+.0f}%" if market_shock!=0 else ""))
         for _,row in df[df['Weight']>25].iterrows():
             st.markdown(f'<div class="rw">⚠️ <b>Concentration:</b> {row["Weight"]:.1f}% in <b>{row["share_name"]}</b></div>',unsafe_allow_html=True)
 
